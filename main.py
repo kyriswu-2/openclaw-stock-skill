@@ -9,11 +9,6 @@ OpenClaw Skill 入口
 使用方式：
   python3 main.py --query "茅台最近30天K线"
   python3 main.py --query "今日涨停统计"
-
-配置云端服务地址（三种方式，优先级从高到低）：
-  1. 命令行参数 --service-url
-  2. 环境变量 AKSHARE_SERVICE_URL
-  3. 默认值 https://akshare.devtool.uk
 """
 
 import argparse
@@ -47,6 +42,9 @@ from router import (
     parse_query,
     IntentObj,
 )
+
+
+DEFAULT_SERVICE_URL = "https://akshare.devtool.uk"
 
 
 # ---------------------------------------------------------------------------
@@ -174,11 +172,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="A股分析 Skill（云端服务版）")
     parser.add_argument("--query", required=True, help="自然语言请求，例如：分析 600519 最近 30 天 K线")
     parser.add_argument("--platform", default="qq", choices=["qq", "telegram"], help="输出平台")
-    parser.add_argument(
-        "--service-url",
-        default=os.environ.get("AKSHARE_SERVICE_URL", "https://akshare.devtool.uk"),
-        help="云端 akshare 数据服务地址，默认读取环境变量 AKSHARE_SERVICE_URL，再回落到 https://akshare.devtool.uk",
-    )
     args = parser.parse_args()
 
     intent_obj = parse_query(args.query)
@@ -189,7 +182,7 @@ def main() -> None:
     elif intent_obj.intent == PORTFOLIO:
         result = _handle_portfolio(intent_obj)
     else:
-        result = call_service(args.service_url, intent_obj)
+        result = call_service(DEFAULT_SERVICE_URL, intent_obj)
 
     try:
         output = _render(intent_obj, result)

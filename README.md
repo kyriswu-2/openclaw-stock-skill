@@ -27,34 +27,15 @@ python3 main.py --query "今日涨停统计"
 python3 main.py --query "上证指数实时行情"
 ```
 
-## 配置自定义服务地址
+默认公共服务地址为 `https://akshare.devtool.uk`。面向普通用户时，直接使用默认配置即可，不需要自建服务，也不需要额外安装 `akshare`、`pandas` 或 `docker`。
 
-三种方式，优先级从高到低：
+## Skill 使用说明
 
-1. 命令行参数
-```bash
-python3 main.py --service-url https://your-server.com --query "茅台K线"
-```
+本仓库已经提供 [SKILL.md](SKILL.md)，skill 名称为 `akshare-api`，可直接使用。
 
-2. 环境变量
-```bash
-export AKSHARE_SERVICE_URL=https://your-server.com
-python3 main.py --query "茅台K线"
-```
-
-3. 默认值（公共服务）：`https://akshare.devtool.uk`
-
-## 自建云端服务
-
-如果你想自己部署数据服务：
-
-```bash
-# 在 service/ 目录下构建并运行 Docker 容器
-docker build -f service/Dockerfile -t akshare-service .
-docker run -d -p 8000:8000 akshare-service
-```
-
-然后使用 `--service-url http://localhost:8000` 或设置 `AKSHARE_SERVICE_URL` 指向你的服务。
+- skill 内部固定调用 `python3 main.py --query "<自然语言问题>"`
+- 服务端地址固定走公共服务 `https://akshare.devtool.uk`
+- 用户只需要像聊天一样输入问题，不需要关心服务部署
 
 ## 文件说明
 

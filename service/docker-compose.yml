@@ -12,6 +12,10 @@ services:
       - "8000:8000"
     environment:
       - TZ=Asia/Shanghai
+      - AKSHARE_PROXY_API=https://share.proxy.qg.net/get?key=KY5JZ4X2
+      - AKSHARE_PROXY_AUTH_KEY=KY5JZ4X2
+      - AKSHARE_PROXY_AUTH_PWD=5C2D184F943D
+      - AKSHARE_PROXY_STRICT=1
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

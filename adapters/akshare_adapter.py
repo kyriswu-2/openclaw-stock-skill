@@ -4,12 +4,25 @@
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from io import StringIO
+import json
 import os
+import threading
 from typing import Any, Dict, Optional
+from urllib.request import urlopen
 
 
 class AkshareAdapter:
+    _proxy_patch_lock = threading.Lock()
+    _proxy_patch_installed = False
+
     def __init__(self) -> None:
+        self._proxy_api = os.getenv("AKSHARE_PROXY_API", "https://share.proxy.qg.net/get?key=KY5JZ4X2")
+        self._proxy_auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", "KY5JZ4X2")
+        self._proxy_auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", "5C2D184F943D")
+        self._proxy_strict = os.getenv("AKSHARE_PROXY_STRICT", "1").lower() not in {"0", "false", "no"}
+
+        self._install_dynamic_proxy_for_requests()
+
         self._ak = None
         self._import_error = None
         try:
@@ -18,6 +31,68 @@ class AkshareAdapter:
             self._ak = ak
         except Exception as exc:
             self._import_error = str(exc)
+
+    def _build_proxy_dict(self) -> Dict[str, str]:
+        if not self._proxy_api or not self._proxy_auth_key or not self._proxy_auth_pwd:
+            raise RuntimeError("proxy settings are incomplete")
+
+        with urlopen(self._proxy_api, timeout=8) as resp:  # nosec B310
+            raw = resp.read().decode("utf-8", errors="replace")
+
+        payload = json.loads(raw)
+        if payload.get("code") != "SUCCESS":
+            raise RuntimeError(f"proxy api failed: {payload}")
+
+        data = payload.get("data") or []
+        if not data:
+            raise RuntimeError("proxy api returned empty data")
+
+        server = str(data[0].get("server") or "").strip()
+        if not server:
+            raise RuntimeError(f"proxy api returned invalid server: {payload}")
+
+        proxy_url = f"http://{self._proxy_auth_key}:{self._proxy_auth_pwd}@{server}"
+        return {"http": proxy_url, "https": proxy_url}
+
+    def _install_dynamic_proxy_for_requests(self) -> None:
+        if AkshareAdapter._proxy_patch_installed:
+            return
+
+        with AkshareAdapter._proxy_patch_lock:
+            if AkshareAdapter._proxy_patch_installed:
+                return
+
+            try:
+                import requests
+            except Exception:
+                return
+
+            original_request = requests.sessions.Session.request
+
+            def request_with_dynamic_proxy(session, method, url, **kwargs):
+                proxy_api_url = os.getenv("AKSHARE_PROXY_API", self._proxy_api)
+                auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", self._proxy_auth_key)
+                auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", self._proxy_auth_pwd)
+                strict_mode = os.getenv("AKSHARE_PROXY_STRICT", "1").lower() not in {"0", "false", "no"}
+
+                # The proxy-provider API itself must be called directly.
+                bypass_proxy = isinstance(url, str) and proxy_api_url and url.startswith(proxy_api_url)
+
+                if not bypass_proxy and auth_key and auth_pwd and proxy_api_url:
+                    try:
+                        self._proxy_api = proxy_api_url
+                        self._proxy_auth_key = auth_key
+                        self._proxy_auth_pwd = auth_pwd
+                        self._proxy_strict = strict_mode
+                        kwargs["proxies"] = self._build_proxy_dict()
+                    except Exception as exc:
+                        if strict_mode:
+                            raise RuntimeError(f"dynamic proxy allocation failed: {exc}") from exc
+
+                return original_request(session, method, url, **kwargs)
+
+            requests.sessions.Session.request = request_with_dynamic_proxy
+            AkshareAdapter._proxy_patch_installed = True
 
     def _wrap(self, fn_name: str, **payload: Any) -> Dict[str, Any]:
         return {
