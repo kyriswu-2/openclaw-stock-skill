@@ -13,7 +13,7 @@ OpenClaw Skill 入口
 配置云端服务地址（三种方式，优先级从高到低）：
   1. 命令行参数 --service-url
   2. 环境变量 AKSHARE_SERVICE_URL
-  3. 默认值 http://localhost:8000
+  3. 默认值 https://akshare.devtool.uk
 """
 
 import argparse
@@ -176,8 +176,8 @@ def main() -> None:
     parser.add_argument("--platform", default="qq", choices=["qq", "telegram"], help="输出平台")
     parser.add_argument(
         "--service-url",
-        default=os.environ.get("AKSHARE_SERVICE_URL", "http://localhost:8000"),
-        help="云端 akshare 数据服务地址，默认读取环境变量 AKSHARE_SERVICE_URL，再回落到 http://localhost:8000",
+        default=os.environ.get("AKSHARE_SERVICE_URL", "https://akshare.devtool.uk"),
+        help="云端 akshare 数据服务地址，默认读取环境变量 AKSHARE_SERVICE_URL，再回落到 https://akshare.devtool.uk",
     )
     args = parser.parse_args()
 
