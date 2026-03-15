@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -26,6 +27,9 @@ class AkshareAdapter:
         self._proxy_auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", "5C2D184F943D")
         self._proxy_strict = os.getenv("AKSHARE_PROXY_STRICT", "1").lower() not in {"0", "false", "no"}
         self._proxy_log_enabled = os.getenv("AKSHARE_PROXY_LOG", "1").lower() not in {"0", "false", "no"}
+        self._proxy_fetch_timeout = float(os.getenv("AKSHARE_PROXY_FETCH_TIMEOUT", "8"))
+        self._proxy_fetch_retries = max(1, int(os.getenv("AKSHARE_PROXY_FETCH_RETRIES", "3")))
+        self._proxy_fetch_backoff_ms = max(0, int(os.getenv("AKSHARE_PROXY_FETCH_BACKOFF_MS", "300")))
 
         self._install_dynamic_proxy_for_requests()
 
@@ -42,31 +46,55 @@ class AkshareAdapter:
         if not self._proxy_api or not self._proxy_auth_key or not self._proxy_auth_pwd:
             raise RuntimeError("proxy settings are incomplete")
 
-        with urlopen(self._proxy_api, timeout=8) as resp:  # nosec B310
-            raw = resp.read().decode("utf-8", errors="replace")
+        start = time.monotonic()
+        last_exc: Optional[Exception] = None
 
-        payload = json.loads(raw)
-        if payload.get("code") != "SUCCESS":
-            raise RuntimeError(f"proxy api failed: {payload}")
+        for attempt in range(1, self._proxy_fetch_retries + 1):
+            try:
+                with urlopen(self._proxy_api, timeout=self._proxy_fetch_timeout) as resp:  # nosec B310
+                    raw = resp.read().decode("utf-8", errors="replace")
 
-        data = payload.get("data") or []
-        if not data:
-            raise RuntimeError("proxy api returned empty data")
+                payload = json.loads(raw)
+                if payload.get("code") != "SUCCESS":
+                    raise RuntimeError(f"proxy api failed: {payload}")
 
-        server = str(data[0].get("server") or "").strip()
-        if not server:
-            raise RuntimeError(f"proxy api returned invalid server: {payload}")
+                data = payload.get("data") or []
+                if not data:
+                    raise RuntimeError("proxy api returned empty data")
 
-        proxy_url = f"http://{self._proxy_auth_key}:{self._proxy_auth_pwd}@{server}"
-        proxy_meta = {
-            "request_id": str(payload.get("request_id") or ""),
-            "server": server,
-            "proxy_ip": str(data[0].get("proxy_ip") or ""),
-            "deadline": str(data[0].get("deadline") or ""),
-            "area": str(data[0].get("area") or ""),
-            "isp": str(data[0].get("isp") or ""),
-        }
-        return {"http": proxy_url, "https": proxy_url}, proxy_meta
+                server = str(data[0].get("server") or "").strip()
+                if not server:
+                    raise RuntimeError(f"proxy api returned invalid server: {payload}")
+
+                proxy_url = f"http://{self._proxy_auth_key}:{self._proxy_auth_pwd}@{server}"
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                proxy_meta = {
+                    "request_id": str(payload.get("request_id") or ""),
+                    "server": server,
+                    "proxy_ip": str(data[0].get("proxy_ip") or ""),
+                    "deadline": str(data[0].get("deadline") or ""),
+                    "area": str(data[0].get("area") or ""),
+                    "isp": str(data[0].get("isp") or ""),
+                    "attempts": attempt,
+                    "elapsed_ms": elapsed_ms,
+                }
+                return {"http": proxy_url, "https": proxy_url}, proxy_meta
+            except Exception as exc:
+                last_exc = exc
+                if self._proxy_log_enabled:
+                    logger.warning(
+                        "proxy_pool_fetch_retry_failed attempt=%s/%s timeout=%.1fs error=%s",
+                        attempt,
+                        self._proxy_fetch_retries,
+                        self._proxy_fetch_timeout,
+                        exc,
+                    )
+                if attempt < self._proxy_fetch_retries and self._proxy_fetch_backoff_ms > 0:
+                    time.sleep(self._proxy_fetch_backoff_ms / 1000)
+
+        raise RuntimeError(
+            f"proxy api failed after {self._proxy_fetch_retries} attempts: {last_exc}"
+        )
 
     def _install_dynamic_proxy_for_requests(self) -> None:
         if AkshareAdapter._proxy_patch_installed:
@@ -89,6 +117,9 @@ class AkshareAdapter:
                 auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", self._proxy_auth_pwd)
                 strict_mode = os.getenv("AKSHARE_PROXY_STRICT", "1").lower() not in {"0", "false", "no"}
                 log_enabled = os.getenv("AKSHARE_PROXY_LOG", "1").lower() not in {"0", "false", "no"}
+                fetch_timeout = os.getenv("AKSHARE_PROXY_FETCH_TIMEOUT")
+                fetch_retries = os.getenv("AKSHARE_PROXY_FETCH_RETRIES")
+                fetch_backoff_ms = os.getenv("AKSHARE_PROXY_FETCH_BACKOFF_MS")
                 target_host = ""
                 if isinstance(url, str):
                     target_host = urlparse(url).netloc or url
@@ -103,11 +134,17 @@ class AkshareAdapter:
                         self._proxy_auth_pwd = auth_pwd
                         self._proxy_strict = strict_mode
                         self._proxy_log_enabled = log_enabled
+                        if fetch_timeout is not None:
+                            self._proxy_fetch_timeout = max(1.0, float(fetch_timeout))
+                        if fetch_retries is not None:
+                            self._proxy_fetch_retries = max(1, int(fetch_retries))
+                        if fetch_backoff_ms is not None:
+                            self._proxy_fetch_backoff_ms = max(0, int(fetch_backoff_ms))
                         proxy_dict, proxy_meta = self._build_proxy_dict()
                         kwargs["proxies"] = proxy_dict
                         if log_enabled:
                             logger.info(
-                                "proxy_pool_allocated method=%s target=%s request_id=%s server=%s proxy_ip=%s deadline=%s area=%s isp=%s",
+                                "proxy_pool_allocated method=%s target=%s request_id=%s server=%s proxy_ip=%s deadline=%s area=%s isp=%s attempts=%s elapsed_ms=%s",
                                 method,
                                 target_host,
                                 proxy_meta.get("request_id"),
@@ -116,6 +153,8 @@ class AkshareAdapter:
                                 proxy_meta.get("deadline"),
                                 proxy_meta.get("area"),
                                 proxy_meta.get("isp"),
+                                proxy_meta.get("attempts"),
+                                proxy_meta.get("elapsed_ms"),
                             )
                     except Exception as exc:
                         if log_enabled:

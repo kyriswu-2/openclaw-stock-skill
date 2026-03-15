@@ -45,13 +45,14 @@ from router import (
 
 
 DEFAULT_SERVICE_URL = "https://akshare.devtool.uk"
+DEFAULT_SERVICE_TIMEOUT = int(os.getenv("OPENCLAW_SERVICE_TIMEOUT", "90"))
 
 
 # ---------------------------------------------------------------------------
 # 从云端服务获取数据
 # ---------------------------------------------------------------------------
 
-def call_service(service_url: str, intent_obj: IntentObj, timeout: int = 30) -> Dict[str, Any]:
+def call_service(service_url: str, intent_obj: IntentObj, timeout: int = DEFAULT_SERVICE_TIMEOUT) -> Dict[str, Any]:
     """向云端数据服务发送请求，返回原始数据字典。"""
     payload = {
         "intent": intent_obj.intent,
