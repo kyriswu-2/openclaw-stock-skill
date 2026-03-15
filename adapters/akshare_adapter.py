@@ -5,10 +5,15 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from io import StringIO
 import json
+import logging
 import os
 import threading
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 from urllib.request import urlopen
+
+
+logger = logging.getLogger("akshare_proxy")
 
 
 class AkshareAdapter:
@@ -20,6 +25,7 @@ class AkshareAdapter:
         self._proxy_auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", "KY5JZ4X2")
         self._proxy_auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", "5C2D184F943D")
         self._proxy_strict = os.getenv("AKSHARE_PROXY_STRICT", "1").lower() not in {"0", "false", "no"}
+        self._proxy_log_enabled = os.getenv("AKSHARE_PROXY_LOG", "1").lower() not in {"0", "false", "no"}
 
         self._install_dynamic_proxy_for_requests()
 
@@ -32,7 +38,7 @@ class AkshareAdapter:
         except Exception as exc:
             self._import_error = str(exc)
 
-    def _build_proxy_dict(self) -> Dict[str, str]:
+    def _build_proxy_dict(self) -> tuple[Dict[str, str], Dict[str, str]]:
         if not self._proxy_api or not self._proxy_auth_key or not self._proxy_auth_pwd:
             raise RuntimeError("proxy settings are incomplete")
 
@@ -52,7 +58,15 @@ class AkshareAdapter:
             raise RuntimeError(f"proxy api returned invalid server: {payload}")
 
         proxy_url = f"http://{self._proxy_auth_key}:{self._proxy_auth_pwd}@{server}"
-        return {"http": proxy_url, "https": proxy_url}
+        proxy_meta = {
+            "request_id": str(payload.get("request_id") or ""),
+            "server": server,
+            "proxy_ip": str(data[0].get("proxy_ip") or ""),
+            "deadline": str(data[0].get("deadline") or ""),
+            "area": str(data[0].get("area") or ""),
+            "isp": str(data[0].get("isp") or ""),
+        }
+        return {"http": proxy_url, "https": proxy_url}, proxy_meta
 
     def _install_dynamic_proxy_for_requests(self) -> None:
         if AkshareAdapter._proxy_patch_installed:
@@ -74,6 +88,10 @@ class AkshareAdapter:
                 auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", self._proxy_auth_key)
                 auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", self._proxy_auth_pwd)
                 strict_mode = os.getenv("AKSHARE_PROXY_STRICT", "1").lower() not in {"0", "false", "no"}
+                log_enabled = os.getenv("AKSHARE_PROXY_LOG", "1").lower() not in {"0", "false", "no"}
+                target_host = ""
+                if isinstance(url, str):
+                    target_host = urlparse(url).netloc or url
 
                 # The proxy-provider API itself must be called directly.
                 bypass_proxy = isinstance(url, str) and proxy_api_url and url.startswith(proxy_api_url)
@@ -84,8 +102,30 @@ class AkshareAdapter:
                         self._proxy_auth_key = auth_key
                         self._proxy_auth_pwd = auth_pwd
                         self._proxy_strict = strict_mode
-                        kwargs["proxies"] = self._build_proxy_dict()
+                        self._proxy_log_enabled = log_enabled
+                        proxy_dict, proxy_meta = self._build_proxy_dict()
+                        kwargs["proxies"] = proxy_dict
+                        if log_enabled:
+                            logger.info(
+                                "proxy_pool_allocated method=%s target=%s request_id=%s server=%s proxy_ip=%s deadline=%s area=%s isp=%s",
+                                method,
+                                target_host,
+                                proxy_meta.get("request_id"),
+                                proxy_meta.get("server"),
+                                proxy_meta.get("proxy_ip"),
+                                proxy_meta.get("deadline"),
+                                proxy_meta.get("area"),
+                                proxy_meta.get("isp"),
+                            )
                     except Exception as exc:
+                        if log_enabled:
+                            logger.warning(
+                                "proxy_pool_allocation_failed method=%s target=%s strict=%s error=%s",
+                                method,
+                                target_host,
+                                strict_mode,
+                                exc,
+                            )
                         if strict_mode:
                             raise RuntimeError(f"dynamic proxy allocation failed: {exc}") from exc
 
