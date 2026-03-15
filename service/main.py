@@ -179,7 +179,7 @@ def dispatch(req: IntentRequest, adapter: AkshareAdapter) -> Dict[str, Any]:
     if req.intent == FUND_BOND:
         top_n = req.top_n or 10
         query = (req.query or "").lower()
-        scope = "bond" if any(k in query for k in ["可转债", "转债", "债"] else "fund"
+        scope = "bond" if any(k in query for k in ["可转债", "转债", "债"]) else "fund"
         return adapter.fund_bond(scope=scope, symbol=req.symbol, top_n=top_n)
 
     if req.intent == HK_US_MARKET:
