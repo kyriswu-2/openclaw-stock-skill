@@ -43,8 +43,12 @@ class AkshareAdapter:
         self._symbol_cache_ttl_sec = max(60, int(os.getenv("AKSHARE_SYMBOL_CACHE_TTL_SEC", "1800")))
         self._symbol_cache_refresh_sec = max(60, int(os.getenv("AKSHARE_SYMBOL_CACHE_REFRESH_SEC", "900")))
         self._symbol_cache_preload = os.getenv("AKSHARE_SYMBOL_CACHE_PRELOAD", "1").lower() not in {"0", "false", "no"}
-        self._symbol_lookup_cache: dict[str, tuple[float, list[dict]]] = {}
-        self._symbol_lookup_cache_lock = threading.Lock()
+        self._symbol_cache_backend = os.getenv("AKSHARE_SYMBOL_CACHE_BACKEND", "redis").strip().lower() or "redis"
+        self._redis_url = os.getenv("AKSHARE_REDIS_URL", "redis://host.docker.internal:6379/0").strip()
+        self._redis_prefix = os.getenv("AKSHARE_REDIS_PREFIX", "akshare:symbol_cache:").strip() or "akshare:symbol_cache:"
+        self._redis_socket_timeout_sec = max(0.2, float(os.getenv("AKSHARE_REDIS_SOCKET_TIMEOUT_SEC", "1.5")))
+        self._redis_client = None
+        self._redis_ready = False
         self._finnhub_api_key = os.getenv("AKSHARE_FINNHUB_API_KEY", os.getenv("FINNHUB_API_KEY", "")).strip()
         self._finnhub_enabled = bool(self._finnhub_api_key)
         self._finnhub_base_url = os.getenv("AKSHARE_FINNHUB_BASE_URL", "https://finnhub.io").strip().rstrip("/")
@@ -60,6 +64,7 @@ class AkshareAdapter:
         self._finnhub_daily_count = 0
 
         self._configure_proxy_logger()
+        self._init_symbol_cache_backend()
         self._install_dynamic_proxy_for_requests()
 
         self._ak = None
@@ -82,6 +87,30 @@ class AkshareAdapter:
         level = getattr(logging, self._proxy_log_level, logging.INFO)
         logger.setLevel(level if self._proxy_log_enabled else logging.WARNING)
         logger.propagate = False
+
+    def _init_symbol_cache_backend(self) -> None:
+        if self._symbol_cache_backend != "redis":
+            raise RuntimeError(
+                f"AKSHARE_SYMBOL_CACHE_BACKEND must be 'redis', got: {self._symbol_cache_backend}"
+            )
+
+        try:
+            import redis  # type: ignore
+
+            self._redis_client = redis.Redis.from_url(
+                self._redis_url,
+                decode_responses=True,
+                socket_timeout=self._redis_socket_timeout_sec,
+                socket_connect_timeout=self._redis_socket_timeout_sec,
+            )
+            self._redis_client.ping()
+            self._redis_ready = True
+            if self._proxy_log_enabled:
+                logger.info("symbol_cache_backend_selected backend=redis redis_url=%s", self._redis_url)
+        except Exception as exc:
+            self._redis_client = None
+            self._redis_ready = False
+            raise RuntimeError(f"redis cache init failed: {exc}") from exc
 
     def _build_proxy_dict(self) -> tuple[Dict[str, str], Dict[str, str]]:
         if not self._proxy_api or not self._proxy_auth_key or not self._proxy_auth_pwd:
@@ -140,23 +169,42 @@ class AkshareAdapter:
     def _symbol_cache_key(self, fn_name: str, kwargs: dict) -> str:
         return f"{fn_name}|{json.dumps(kwargs or {}, sort_keys=True, ensure_ascii=False)}"
 
+    def _redis_symbol_cache_key(self, cache_key: str) -> str:
+        return f"{self._redis_prefix}{cache_key}"
+
     def _get_symbol_records_from_cache(self, fn_name: str, kwargs: dict) -> Optional[list[dict]]:
         cache_key = self._symbol_cache_key(fn_name, kwargs)
-        now = time.time()
-        with self._symbol_lookup_cache_lock:
-            cached = self._symbol_lookup_cache.get(cache_key)
-            if not cached:
+
+        if not self._redis_ready or self._redis_client is None:
+            raise RuntimeError("redis cache is not ready")
+
+        try:
+            raw = self._redis_client.get(self._redis_symbol_cache_key(cache_key))
+            if not raw:
                 return None
-            ts, records = cached
-            if now - ts > self._symbol_cache_ttl_sec:
-                self._symbol_lookup_cache.pop(cache_key, None)
-                return None
-            return records
+            payload = json.loads(raw)
+            records = payload.get("records")
+            if isinstance(records, list):
+                return records
+            return None
+        except Exception as exc:
+            raise RuntimeError(f"symbol cache redis get failed: {exc}") from exc
 
     def _set_symbol_records_cache(self, fn_name: str, kwargs: dict, records: list[dict]) -> None:
         cache_key = self._symbol_cache_key(fn_name, kwargs)
-        with self._symbol_lookup_cache_lock:
-            self._symbol_lookup_cache[cache_key] = (time.time(), records)
+
+        if not self._redis_ready or self._redis_client is None:
+            raise RuntimeError("redis cache is not ready")
+
+        try:
+            payload = json.dumps({"records": records}, ensure_ascii=False)
+            self._redis_client.setex(
+                self._redis_symbol_cache_key(cache_key),
+                self._symbol_cache_ttl_sec,
+                payload,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"symbol cache redis set failed: {exc}") from exc
 
     def _fetch_symbol_records(self, fn_name: str, kwargs: Optional[dict] = None) -> tuple[Optional[list[dict]], Optional[str]]:
         if self._ak is None:

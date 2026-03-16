@@ -8,6 +8,8 @@ services:
     image: akshare-stock-service:latest
     container_name: akshare-stock-service
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "8000:8000"
     environment:
@@ -23,6 +25,10 @@ services:
       - AKSHARE_PROXY_FETCH_BACKOFF_MS=300
       - AKSHARE_API_RETRIES=3
       - AKSHARE_API_BACKOFF_MS=400
+      - AKSHARE_SYMBOL_CACHE_BACKEND=redis
+      - AKSHARE_REDIS_URL=redis://host.docker.internal:6379/0
+      - AKSHARE_REDIS_PREFIX=akshare:symbol_cache:
+      - AKSHARE_REDIS_SOCKET_TIMEOUT_SEC=1.5
       - AKSHARE_SYMBOL_CACHE_PRELOAD=0
       - AKSHARE_SYMBOL_CACHE_TTL_SEC=86400
       - AKSHARE_SYMBOL_CACHE_REFRESH_SEC=21600
