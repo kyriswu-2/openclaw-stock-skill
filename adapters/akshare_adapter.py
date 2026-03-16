@@ -440,6 +440,7 @@ class AkshareAdapter:
         q_lower = q.lower()
 
         is_a_share = raw.isdigit() and len(raw) == 6
+        is_hk_numeric = raw_upper.isdigit() and len(raw_upper) in {4, 5}
         is_hk_hint = raw_upper.startswith("HK") or "港股" in q
         is_us_hint = any(k in q_lower for k in ["美股", "nasdaq", "dow", "sp500", "s&p", "纳指", "道琼斯", "标普"])
         index_names = self._index_name_candidates(symbol=raw, query=q)
@@ -462,6 +463,11 @@ class AkshareAdapter:
                     "stock_hk_hist",
                     [{"symbol": hk_symbol, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
                 ))
+        elif is_hk_numeric:
+            candidates.append((
+                "stock_hk_hist",
+                [{"symbol": raw_upper.zfill(5), "period": period, "start_date": start, "end_date": end, "adjust": ""}],
+            ))
 
         if is_us_hint and raw_upper:
             us_symbol_pool = [raw_upper]
@@ -480,7 +486,7 @@ class AkshareAdapter:
                 candidates.append(("index_global_hist_em", [{"symbol": idx_name}]))
 
         # Broad fallbacks for ambiguous symbols.
-        if raw and not is_a_share:
+        if raw and not is_a_share and not is_index_hint:
             candidates.append(("index_global_hist_em", [{"symbol": raw}]))
             candidates.append((
                 "stock_hk_hist",
@@ -491,14 +497,35 @@ class AkshareAdapter:
                 [{"symbol": raw_upper, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
             ))
 
-        # Always keep A-share as the last fallback for six-digit inputs.
-        if raw:
+        # Keep A-share fallback only for six-digit numeric symbols.
+        if is_a_share:
             candidates.append((
                 "stock_zh_a_hist",
                 [{"symbol": raw, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
             ))
 
         return candidates
+
+    def _is_valid_kline_result(self, data: Any) -> bool:
+        if data is None:
+            return False
+
+        if self._data_len(data) <= 0:
+            return False
+
+        if not hasattr(data, "columns"):
+            return True
+
+        try:
+            columns = [str(c).strip().lower() for c in data.columns]
+        except Exception:
+            return True
+
+        ohlc_markers = {
+            "open", "high", "low", "close", "volume",
+            "开盘", "最高", "最低", "收盘", "成交量",
+        }
+        return any(any(marker in col for marker in ohlc_markers) for col in columns)
 
     def _fetch_kline_df(
         self,
@@ -509,16 +536,32 @@ class AkshareAdapter:
         query: Optional[str] = None,
     ) -> tuple[Optional[str], Any, str]:
         candidates = self._build_kline_candidates(symbol=symbol, period=period, start=start, end=end, query=query)
-        used_fn, df, error = self._call_api_candidates(candidates)
-        if used_fn is None:
-            return None, None, error
+        errors = []
 
-        if hasattr(df, "iloc"):
-            try:
-                df = df.iloc[::-1]
-            except Exception:
-                pass
-        return used_fn, df, ""
+        for fn_name, kwargs_list in candidates:
+            func = getattr(self._ak, fn_name, None)
+            if func is None:
+                continue
+
+            args_pool = kwargs_list or [{}]
+            for kwargs in args_pool:
+                df, error = self._call_with_retries(fn_name=fn_name, func=func, kwargs=kwargs)
+                if error is not None:
+                    errors.append(error)
+                    continue
+
+                if not self._is_valid_kline_result(df):
+                    errors.append(f"{fn_name}({kwargs}) returned empty or non-kline data")
+                    continue
+
+                if hasattr(df, "iloc"):
+                    try:
+                        df = df.iloc[::-1]
+                    except Exception:
+                        pass
+                return fn_name, df, ""
+
+        return None, None, "; ".join(errors) if errors else "no callable api found"
 
     def stock_kline(
         self,
