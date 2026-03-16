@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 from urllib.request import urlopen
 
 
@@ -45,6 +45,19 @@ class AkshareAdapter:
         self._symbol_cache_preload = os.getenv("AKSHARE_SYMBOL_CACHE_PRELOAD", "1").lower() not in {"0", "false", "no"}
         self._symbol_lookup_cache: dict[str, tuple[float, list[dict]]] = {}
         self._symbol_lookup_cache_lock = threading.Lock()
+        self._finnhub_api_key = os.getenv("AKSHARE_FINNHUB_API_KEY", os.getenv("FINNHUB_API_KEY", "")).strip()
+        self._finnhub_enabled = bool(self._finnhub_api_key)
+        self._finnhub_base_url = os.getenv("AKSHARE_FINNHUB_BASE_URL", "https://finnhub.io").strip().rstrip("/")
+        self._finnhub_min_interval_sec = max(0.2, float(os.getenv("AKSHARE_FINNHUB_MIN_INTERVAL_SEC", "1.2")))
+        self._finnhub_daily_budget = max(1, int(os.getenv("AKSHARE_FINNHUB_DAILY_BUDGET", "1000")))
+        self._finnhub_search_cache_ttl_sec = max(600, int(os.getenv("AKSHARE_FINNHUB_SEARCH_CACHE_TTL_SEC", "86400")))
+        self._finnhub_quote_cache_ttl_sec = max(60, int(os.getenv("AKSHARE_FINNHUB_QUOTE_CACHE_TTL_SEC", "7200")))
+        self._finnhub_cache: dict[str, tuple[float, dict]] = {}
+        self._finnhub_cache_lock = threading.Lock()
+        self._finnhub_rate_lock = threading.Lock()
+        self._finnhub_last_call_ts = 0.0
+        self._finnhub_daily_date = datetime.now().strftime("%Y-%m-%d")
+        self._finnhub_daily_count = 0
 
         self._configure_proxy_logger()
         self._install_dynamic_proxy_for_requests()
@@ -170,25 +183,179 @@ class AkshareAdapter:
         return records, None
 
     def _build_symbol_preload_plan(self) -> list[tuple[str, list[dict]]]:
-        return [
+        plan = [
             ("stock_info_a_code_name", [{}]),
             ("stock_zh_a_spot_em", [{}]),
             ("stock_hk_spot_em", [{}]),
-            ("stock_us_spot_em", [{}]),
             ("stock_zh_index_spot_em", [{}]),
             ("stock_zh_index_spot_sina", [{}]),
-            (
-                "stock_us_famous_spot_em",
-                [
-                    {"symbol": "科技类"},
-                    {"symbol": "金融类"},
-                    {"symbol": "医药食品类"},
-                    {"symbol": "媒体类"},
-                    {"symbol": "汽车能源类"},
-                    {"symbol": "制造零售类"},
-                ],
-            ),
         ]
+        if not self._finnhub_enabled:
+            plan.extend([
+                ("stock_us_spot_em", [{}]),
+                (
+                    "stock_us_famous_spot_em",
+                    [
+                        {"symbol": "科技类"},
+                        {"symbol": "金融类"},
+                        {"symbol": "医药食品类"},
+                        {"symbol": "媒体类"},
+                        {"symbol": "汽车能源类"},
+                        {"symbol": "制造零售类"},
+                    ],
+                ),
+            ])
+        return plan
+
+    def _finnhub_cache_key(self, endpoint: str, params: dict) -> str:
+        return f"{endpoint}|{json.dumps(params or {}, sort_keys=True, ensure_ascii=False)}"
+
+    def _get_finnhub_cache(self, endpoint: str, params: dict, ttl_sec: int) -> Optional[dict]:
+        now = time.time()
+        key = self._finnhub_cache_key(endpoint, params)
+        with self._finnhub_cache_lock:
+            cached = self._finnhub_cache.get(key)
+            if not cached:
+                return None
+            ts, payload = cached
+            if now - ts > ttl_sec:
+                self._finnhub_cache.pop(key, None)
+                return None
+            return payload
+
+    def _set_finnhub_cache(self, endpoint: str, params: dict, payload: dict) -> None:
+        key = self._finnhub_cache_key(endpoint, params)
+        with self._finnhub_cache_lock:
+            self._finnhub_cache[key] = (time.time(), payload)
+
+    def _finnhub_reserve_quota(self) -> tuple[bool, str]:
+        with self._finnhub_rate_lock:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self._finnhub_daily_date != today:
+                self._finnhub_daily_date = today
+                self._finnhub_daily_count = 0
+
+            if self._finnhub_daily_count >= self._finnhub_daily_budget:
+                return False, f"finnhub daily budget exceeded: {self._finnhub_daily_count}/{self._finnhub_daily_budget}"
+
+            sleep_sec = self._finnhub_min_interval_sec - (time.monotonic() - self._finnhub_last_call_ts)
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+
+            self._finnhub_last_call_ts = time.monotonic()
+            self._finnhub_daily_count += 1
+            return True, ""
+
+    def _finnhub_get_json(self, endpoint: str, params: dict, ttl_sec: int) -> tuple[Optional[dict], Optional[str]]:
+        if not self._finnhub_enabled:
+            return None, "finnhub disabled"
+
+        query_params = dict(params or {})
+        cached = self._get_finnhub_cache(endpoint, query_params, ttl_sec)
+        if cached is not None:
+            return cached, None
+
+        ok, quota_error = self._finnhub_reserve_quota()
+        if not ok:
+            return None, quota_error
+
+        query_params["token"] = self._finnhub_api_key
+        query = urlencode(query_params)
+        url = f"{self._finnhub_base_url}{endpoint}?{query}"
+
+        try:
+            with urlopen(url, timeout=max(3.0, self._proxy_fetch_timeout)) as resp:  # nosec B310
+                raw = resp.read().decode("utf-8", errors="replace")
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and payload.get("error"):
+                return None, f"finnhub error: {payload.get('error')}"
+
+            if isinstance(payload, dict):
+                self._set_finnhub_cache(endpoint, params or {}, payload)
+                return payload, None
+            return None, "finnhub returned non-object payload"
+        except Exception as exc:
+            return None, str(exc)
+
+    def _resolve_symbol_with_finnhub(self, target: str) -> str:
+        payload, error = self._finnhub_get_json(
+            endpoint="/api/v1/search",
+            params={"q": target},
+            ttl_sec=self._finnhub_search_cache_ttl_sec,
+        )
+        if error is not None or not payload:
+            return ""
+
+        candidates = payload.get("result")
+        if not isinstance(candidates, list):
+            return ""
+
+        target_upper = str(target or "").strip().upper()
+        if not target_upper:
+            return ""
+
+        scored: list[tuple[int, str]] = []
+        for row in candidates:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            desc = str(row.get("description") or "").strip().upper()
+            display_symbol = str(row.get("displaySymbol") or "").strip().upper()
+            score = 0
+            if symbol == target_upper or display_symbol == target_upper:
+                score += 100
+            if target_upper in symbol:
+                score += 40
+            if target_upper in desc:
+                score += 20
+            if "." not in symbol:
+                score += 5
+            scored.append((score, symbol))
+
+        if not scored:
+            return ""
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1]
+
+    def _get_finnhub_us_quote(self, symbol: str) -> tuple[Optional[dict], Optional[str]]:
+        clean_symbol = str(symbol or "").strip().upper()
+        if not clean_symbol:
+            return None, "empty symbol"
+
+        payload, error = self._finnhub_get_json(
+            endpoint="/api/v1/quote",
+            params={"symbol": clean_symbol},
+            ttl_sec=self._finnhub_quote_cache_ttl_sec,
+        )
+        if error is not None or not payload:
+            return None, error or "empty payload"
+
+        current = payload.get("c")
+        if current in (None, 0) and payload.get("t") in (None, 0):
+            return None, "finnhub quote empty"
+
+        prev_close = payload.get("pc")
+        pct = None
+        try:
+            if prev_close not in (None, 0):
+                pct = ((float(current) - float(prev_close)) / float(prev_close)) * 100
+        except Exception:
+            pct = None
+
+        quote = {
+            "symbol": clean_symbol,
+            "price": current,
+            "change": payload.get("d"),
+            "change_pct": payload.get("dp") if payload.get("dp") not in (None, "") else pct,
+            "high": payload.get("h"),
+            "low": payload.get("l"),
+            "open": payload.get("o"),
+            "prev_close": prev_close,
+            "timestamp": payload.get("t"),
+        }
+        return quote, None
 
     def _refresh_symbol_cache_once(self) -> None:
         if self._ak is None:
@@ -533,6 +700,11 @@ class AkshareAdapter:
             "us": any(k in q_lower for k in ["美股", "nasdaq", "dow", "spx", "标普", "道琼斯", "纳指", "us"]),
             "index": any(k in q for k in ["指数", "大盘"]),
         }
+
+        if market_hints["us"] and self._finnhub_enabled:
+            finnhub_symbol = self._resolve_symbol_with_finnhub(target)
+            if finnhub_symbol:
+                return finnhub_symbol
 
         search_plan: list[tuple[str, list[dict], list[str]]] = []
         if market_hints["hk"]:
@@ -1380,6 +1552,13 @@ class AkshareAdapter:
             return err
 
         resolved_symbol = self._resolve_symbol_with_akshare(symbol, query=query) if symbol else None
+
+        if market == "us" and resolved_symbol and self._finnhub_enabled:
+            quote, quote_error = self._get_finnhub_us_quote(resolved_symbol)
+            if quote is not None:
+                return self._wrap("finnhub_quote", market=market, symbol=resolved_symbol, items=[quote])
+            if self._proxy_log_enabled:
+                logger.warning("finnhub_quote_failed symbol=%s error=%s", resolved_symbol, quote_error)
 
         used_fn = "stock_us_spot_em" if market == "us" else "stock_hk_spot_em"
         records, error = self._fetch_symbol_records(used_fn, {})
