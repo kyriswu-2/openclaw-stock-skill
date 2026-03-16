@@ -12,7 +12,7 @@ services:
       - "8000:8000"
     environment:
       - TZ=Asia/Shanghai
-      - AKSHARE_PROXY_URL=socks5://umwhniat-rotate:eudczfs5mkzt@p.webshare.io:80/
+      - AKSHARE_PROXY_URL=http://umwhniat-rotate:eudczfs5mkzt@p.webshare.io:80/
       - AKSHARE_PROXY_API=https://share.proxy.qg.net/get?key=KY5JZ4X2
       - AKSHARE_PROXY_AUTH_KEY=KY5JZ4X2
       - AKSHARE_PROXY_AUTH_PWD=5C2D184F943D
