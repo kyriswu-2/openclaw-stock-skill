@@ -22,6 +22,7 @@ class AkshareAdapter:
     _proxy_patch_installed = False
 
     def __init__(self) -> None:
+        self._proxy_url = os.getenv("AKSHARE_PROXY_URL", "").strip()
         self._proxy_api = os.getenv("AKSHARE_PROXY_API", "https://share.proxy.qg.net/get?key=KY5JZ4X2")
         self._proxy_auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", "KY5JZ4X2")
         self._proxy_auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", "5C2D184F943D")
@@ -112,6 +113,7 @@ class AkshareAdapter:
             original_request = requests.sessions.Session.request
 
             def request_with_dynamic_proxy(session, method, url, **kwargs):
+                fixed_proxy_url = os.getenv("AKSHARE_PROXY_URL", self._proxy_url).strip()
                 proxy_api_url = os.getenv("AKSHARE_PROXY_API", self._proxy_api)
                 auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", self._proxy_auth_key)
                 auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", self._proxy_auth_pwd)
@@ -127,8 +129,18 @@ class AkshareAdapter:
                 # The proxy-provider API itself must be called directly.
                 bypass_proxy = isinstance(url, str) and proxy_api_url and url.startswith(proxy_api_url)
 
-                if not bypass_proxy and auth_key and auth_pwd and proxy_api_url:
+                if not bypass_proxy and fixed_proxy_url:
+                    kwargs["proxies"] = {"http": fixed_proxy_url, "https": fixed_proxy_url}
+                    if log_enabled:
+                        logger.info(
+                            "proxy_fixed_allocated method=%s target=%s proxy=%s",
+                            method,
+                            target_host,
+                            fixed_proxy_url,
+                        )
+                elif not bypass_proxy and auth_key and auth_pwd and proxy_api_url:
                     try:
+                        self._proxy_url = fixed_proxy_url
                         self._proxy_api = proxy_api_url
                         self._proxy_auth_key = auth_key
                         self._proxy_auth_pwd = auth_pwd
