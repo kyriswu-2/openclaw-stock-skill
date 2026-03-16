@@ -1381,20 +1381,17 @@ class AkshareAdapter:
 
         resolved_symbol = self._resolve_symbol_with_akshare(symbol, query=query) if symbol else None
 
-        if market == "us":
-            candidates = [
-                ("stock_us_spot_em", [{}]),
-            ]
-        else:
-            candidates = [
-                ("stock_hk_spot_em", [{}]),
-            ]
+        used_fn = "stock_us_spot_em" if market == "us" else "stock_hk_spot_em"
+        records, error = self._fetch_symbol_records(used_fn, {})
+        if error is not None or records is None:
+            # Fallback to direct call if cache path fails.
+            candidates = [(used_fn, [{}])]
+            fallback_fn, df, fallback_error = self._call_api_candidates(candidates)
+            if fallback_fn is None:
+                return self._error(fn_name, fallback_error)
+            used_fn = fallback_fn
+            records = self._to_records(df, top_n=top_n * 5)
 
-        used_fn, df, error = self._call_api_candidates(candidates)
-        if used_fn is None:
-            return self._error(fn_name, error)
-
-        records = self._to_records(df, top_n=top_n * 5)
         if resolved_symbol and isinstance(records, list):
             filtered = self._filter_records_by_symbol(records, resolved_symbol)
             records = filtered[:top_n] if filtered else records[:top_n]
