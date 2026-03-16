@@ -26,7 +26,7 @@ class AkshareAdapter:
     _request_ctx = threading.local()
 
     def __init__(self) -> None:
-        self._proxy_url = os.getenv("AKSHARE_PROXY_URL", "").strip()
+        self._proxy_url = os.getenv("AKSHARE_PROXY_URL", "socks5://umwhniat-rotate:eudczfs5mkzt@p.webshare.io:80/").strip()
         self._proxy_api = os.getenv("AKSHARE_PROXY_API", "https://share.proxy.qg.net/get?key=KY5JZ4X2")
         self._proxy_auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", "KY5JZ4X2")
         self._proxy_auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", "5C2D184F943D")
