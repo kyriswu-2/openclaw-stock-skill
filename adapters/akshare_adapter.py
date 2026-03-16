@@ -8,6 +8,7 @@ from io import StringIO
 import json
 import logging
 import os
+import re
 import ssl
 import threading
 import time
@@ -44,8 +45,17 @@ class AkshareAdapter:
         self._symbol_cache_refresh_sec = max(60, int(os.getenv("AKSHARE_SYMBOL_CACHE_REFRESH_SEC", "900")))
         self._symbol_cache_preload = os.getenv("AKSHARE_SYMBOL_CACHE_PRELOAD", "1").lower() not in {"0", "false", "no"}
         self._symbol_cache_backend = os.getenv("AKSHARE_SYMBOL_CACHE_BACKEND", "redis").strip().lower() or "redis"
+        self._symbol_resolve_cache_ttl_sec = max(300, int(os.getenv("AKSHARE_SYMBOL_RESOLVE_CACHE_TTL_SEC", "86400")))
         self._redis_url = os.getenv("AKSHARE_REDIS_URL", "redis://host.docker.internal:6379/0").strip()
         self._redis_prefix = os.getenv("AKSHARE_REDIS_PREFIX", "akshare:symbol_cache:").strip() or "akshare:symbol_cache:"
+        self._redis_symbol_resolve_prefix = os.getenv(
+            "AKSHARE_REDIS_SYMBOL_RESOLVE_PREFIX",
+            "akshare:symbol_resolve:",
+        ).strip() or "akshare:symbol_resolve:"
+        self._redis_finnhub_prefix = os.getenv(
+            "AKSHARE_REDIS_FINNHUB_PREFIX",
+            "akshare:finnhub:",
+        ).strip() or "akshare:finnhub:"
         self._redis_socket_timeout_sec = max(0.2, float(os.getenv("AKSHARE_REDIS_SOCKET_TIMEOUT_SEC", "1.5")))
         self._redis_client = None
         self._redis_ready = False
@@ -56,8 +66,6 @@ class AkshareAdapter:
         self._finnhub_daily_budget = max(1, int(os.getenv("AKSHARE_FINNHUB_DAILY_BUDGET", "1000")))
         self._finnhub_search_cache_ttl_sec = max(600, int(os.getenv("AKSHARE_FINNHUB_SEARCH_CACHE_TTL_SEC", "86400")))
         self._finnhub_quote_cache_ttl_sec = max(60, int(os.getenv("AKSHARE_FINNHUB_QUOTE_CACHE_TTL_SEC", "7200")))
-        self._finnhub_cache: dict[str, tuple[float, dict]] = {}
-        self._finnhub_cache_lock = threading.Lock()
         self._finnhub_rate_lock = threading.Lock()
         self._finnhub_last_call_ts = 0.0
         self._finnhub_daily_date = datetime.now().strftime("%Y-%m-%d")
@@ -172,6 +180,54 @@ class AkshareAdapter:
     def _redis_symbol_cache_key(self, cache_key: str) -> str:
         return f"{self._redis_prefix}{cache_key}"
 
+    def _redis_symbol_resolve_cache_key(self, cache_key: str) -> str:
+        return f"{self._redis_symbol_resolve_prefix}{cache_key}"
+
+    def _redis_finnhub_cache_key(self, cache_key: str) -> str:
+        return f"{self._redis_finnhub_prefix}{cache_key}"
+
+    def _symbol_resolve_cache_key(self, target: str, scope: str) -> str:
+        target_norm = str(target or "").strip().lower()
+        scope_norm = str(scope or "").strip().lower() or "all"
+        return f"{scope_norm}|{target_norm}"
+
+    def _get_resolved_symbol_from_cache(self, target: str, scope: str) -> str:
+        cache_key = self._symbol_resolve_cache_key(target=target, scope=scope)
+        if not self._redis_ready or self._redis_client is None:
+            return ""
+
+        try:
+            raw = self._redis_client.get(self._redis_symbol_resolve_cache_key(cache_key))
+            if not raw:
+                return ""
+
+            payload = json.loads(raw)
+            symbol = str(payload.get("symbol") or "").strip()
+            if not symbol:
+                return ""
+            return symbol
+        except Exception:
+            return ""
+
+    def _set_resolved_symbol_cache(self, target: str, scope: str, symbol: str) -> None:
+        resolved = str(symbol or "").strip()
+        if not resolved:
+            return
+
+        cache_key = self._symbol_resolve_cache_key(target=target, scope=scope)
+        if not self._redis_ready or self._redis_client is None:
+            return
+
+        try:
+            payload = json.dumps({"symbol": resolved}, ensure_ascii=False)
+            self._redis_client.setex(
+                self._redis_symbol_resolve_cache_key(cache_key),
+                self._symbol_resolve_cache_ttl_sec,
+                payload,
+            )
+        except Exception:
+            return
+
     def _get_symbol_records_from_cache(self, fn_name: str, kwargs: dict) -> Optional[list[dict]]:
         cache_key = self._symbol_cache_key(fn_name, kwargs)
 
@@ -259,22 +315,34 @@ class AkshareAdapter:
         return f"{endpoint}|{json.dumps(params or {}, sort_keys=True, ensure_ascii=False)}"
 
     def _get_finnhub_cache(self, endpoint: str, params: dict, ttl_sec: int) -> Optional[dict]:
-        now = time.time()
         key = self._finnhub_cache_key(endpoint, params)
-        with self._finnhub_cache_lock:
-            cached = self._finnhub_cache.get(key)
-            if not cached:
-                return None
-            ts, payload = cached
-            if now - ts > ttl_sec:
-                self._finnhub_cache.pop(key, None)
-                return None
-            return payload
+        if not self._redis_ready or self._redis_client is None:
+            return None
 
-    def _set_finnhub_cache(self, endpoint: str, params: dict, payload: dict) -> None:
+        try:
+            raw = self._redis_client.get(self._redis_finnhub_cache_key(key))
+            if not raw:
+                return None
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                return payload
+            return None
+        except Exception:
+            return None
+
+    def _set_finnhub_cache(self, endpoint: str, params: dict, payload: dict, ttl_sec: int) -> None:
         key = self._finnhub_cache_key(endpoint, params)
-        with self._finnhub_cache_lock:
-            self._finnhub_cache[key] = (time.time(), payload)
+        if not self._redis_ready or self._redis_client is None:
+            return
+
+        try:
+            self._redis_client.setex(
+                self._redis_finnhub_cache_key(key),
+                max(1, int(ttl_sec)),
+                json.dumps(payload, ensure_ascii=False),
+            )
+        except Exception:
+            return
 
     def _finnhub_reserve_quota(self) -> tuple[bool, str]:
         with self._finnhub_rate_lock:
@@ -319,7 +387,7 @@ class AkshareAdapter:
                 return None, f"finnhub error: {payload.get('error')}"
 
             if isinstance(payload, dict):
-                self._set_finnhub_cache(endpoint, params or {}, payload)
+                self._set_finnhub_cache(endpoint, params or {}, payload, ttl_sec=ttl_sec)
                 return payload, None
             return None, "finnhub returned non-object payload"
         except Exception as exc:
@@ -684,6 +752,35 @@ class AkshareAdapter:
 
         return False
 
+    def _normalize_symbol_target(self, symbol: str) -> str:
+        raw = str(symbol or "").strip()
+        if not raw:
+            return ""
+
+        # Keep explicit codes untouched.
+        if self._is_explicit_symbol(raw):
+            return raw
+
+        # For natural-language Chinese phrases, extract the core stock name token.
+        if any(ord(ch) > 127 for ch in raw):
+            cleaned = raw
+            stop_words = [
+                "查看", "查一下", "查下", "帮我", "请", "今天", "今日", "昨天", "昨日",
+                "现在", "最新", "价格", "股价", "报价", "行情", "走势", "的", "一下",
+            ]
+            for word in stop_words:
+                cleaned = cleaned.replace(word, " ")
+
+            cleaned = re.sub(r"[，。,.?？!！:：;；()（）\[\]{}<>《》/\\|_\-+]", " ", cleaned)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+            tokens = re.findall(r"[\u4e00-\u9fff]{2,12}", cleaned)
+            if tokens:
+                tokens.sort(key=len, reverse=True)
+                return tokens[0]
+
+        return raw
+
     def _match_target_in_records(
         self,
         records: list[dict],
@@ -742,16 +839,21 @@ class AkshareAdapter:
 
         q = query or ""
         q_lower = q.lower()
-        target = raw.strip()
+        target = self._normalize_symbol_target(raw)
         market_hints = {
             "hk": any(k in q for k in ["港股", "恒生", "恒指"]),
             "us": any(k in q_lower for k in ["美股", "nasdaq", "dow", "spx", "标普", "道琼斯", "纳指", "us"]),
             "index": any(k in q for k in ["指数", "大盘"]),
         }
+        scope = "us" if market_hints["us"] else "hk" if market_hints["hk"] else "index" if market_hints["index"] else "a"
+        cached_symbol = self._get_resolved_symbol_from_cache(target=target, scope=scope)
+        if cached_symbol:
+            return cached_symbol
 
         if market_hints["us"] and self._finnhub_enabled:
             finnhub_symbol = self._resolve_symbol_with_finnhub(target)
             if finnhub_symbol:
+                self._set_resolved_symbol_cache(target=target, scope=scope, symbol=finnhub_symbol)
                 return finnhub_symbol
 
         search_plan: list[tuple[str, list[dict], list[str]]] = []
@@ -774,10 +876,6 @@ class AkshareAdapter:
         if not (market_hints["hk"] or market_hints["us"]):
             search_plan.extend([
                 ("stock_info_a_code_name", [{}], ["code", "代码"]),
-                ("stock_zh_a_spot_em", [{}], ["代码"]),
-                ("stock_sh_a_spot_em", [{}], ["代码"]),
-                ("stock_sz_a_spot_em", [{}], ["代码"]),
-                ("stock_bj_a_spot_em", [{}], ["代码"]),
             ])
 
         match_keys = ["名称", "name", "证券简称", "股票简称", "中文名称", "代码", "code", "symbol", "指数名称", "简称"]
@@ -789,8 +887,11 @@ class AkshareAdapter:
                     continue
                 matched = self._match_target_in_records(records, target=target, return_keys=return_keys, match_keys=match_keys)
                 if matched:
+                    self._set_resolved_symbol_cache(target=target, scope=scope, symbol=matched)
                     return matched
 
+        # Cache unresolved fallback too, to avoid repeatedly scanning all sources for the same phrase.
+        self._set_resolved_symbol_cache(target=target, scope=scope, symbol=raw)
         return raw
 
     def _filter_records_by_symbol(self, records: list[dict], symbol: str) -> list[dict]:

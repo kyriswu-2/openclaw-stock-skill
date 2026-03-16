@@ -88,15 +88,10 @@ def _extract_target(query: str) -> Optional[str]:
     for pattern in cleanup_patterns:
         cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
 
+    # 只保留少量高频噪声词；更复杂语义优先交给 skill 侧 canonicalization。
     stop_words = [
-        "实时", "行情", "大盘", "指数", "K线图", "k线图", "K线", "k线", "日线", "周线", "月线",
-        "分时", "盘口", "逐笔", "量能", "放量", "缩量", "走势图", "趋势图", "分析", "看下", "评估", "综合",
-        "资金流向", "资金流", "主力资金", "北向资金", "南向资金", "行业资金", "板块资金",
-        "基本面", "财报", "财务", "市盈率", "市净率", "估值", "ROE", "roe", "毛利率", "净利率", "资产负债率",
-        "融资融券", "龙虎榜", "两融", "融资余额", "融券余额", "研报", "研究报告", "机构评级",
-        "财经新闻", "个股新闻", "新闻资讯", "新闻", "板块", "行业", "概念", "题材", "轮动",
-        "涨幅榜", "跌幅榜", "港股", "美股", "基金", "净值", "可转债", "转债", "债券", "ETF", "etf",
-        "期货", "期权", "衍生品", "主力合约", "帮助", "说明",
+        "查看", "查一下", "查下", "帮我", "请", "今天", "今日", "昨天", "昨日", "现在", "最新",
+        "价格", "股价", "报价", "行情", "走势", "分析", "看下", "评估", "综合", "的", "一下",
     ]
     for word in stop_words:
         cleaned = cleaned.replace(word, " ")
@@ -180,6 +175,9 @@ def _extract_top_n(query: str) -> Optional[int]:
 def _classify_intent(query: str) -> str:
     q = query.lower()
 
+    if any(k in query for k in ["价格", "股价", "报价"]):
+        return STOCK_OVERVIEW
+
     if any(k in query for k in ["涨停", "跌停", "涨跌停"]):
         return LIMIT_STATS
     if any(k in query for k in ["推荐股票", "选股", "股票推荐", "有什么股票推荐"]):
@@ -232,6 +230,7 @@ def _classify_intent(query: str) -> str:
 
 def parse_query(query: str) -> IntentObj:
     query = (query or "").strip()
+
     return IntentObj(
         intent=_classify_intent(query),
         query=query,

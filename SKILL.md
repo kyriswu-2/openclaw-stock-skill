@@ -1,5 +1,5 @@
 ---
-name: akshare-api
+name: openclaw-stock-skill
 description: Use this skill when the user wants Chinese stock market data or analysis, including A-share行情、上证/深证/创业板指数、个股K线、涨跌停统计、资金流向、基本面、板块表现、港股美股行情、基金可转债、财经新闻和研报。 The skill runs the local client at main.py and sends the query to the default Akshare service. Prefer this skill for direct market data lookups in Chinese.
 metadata:
   version: 1.0.0
@@ -105,6 +105,27 @@ python3 main.py --query "<拆解后、保留原意的查询语句>"
 - 搜索后仍不确定时，只追问用户 1 个最关键问题，不要连续追问。
 - 对于名称类输入，优先用 AkShare 文档对应的列表/实时接口完成运行时解析，不要在 skill 中维护大量固定映射。
 - 如果用户的问题明显属于以下模式，可直接执行：
+
+### Decomposition-First Canonicalization (Recommended)
+
+不要在 query 中拆解元数据标签。skill 应输出“拆解后的自然语言标准查询”，让代码层继续用通用解析兜底。
+
+执行规则：
+
+- 先拆解出：意图、标的、时间范围、指标。
+- 再重写为一句自然语言标准 query（保留原意，不臆造参数）。
+- 重写结果尽量包含：市场线索 + 标的 + 周期/日期 + 指标。
+
+示例：
+
+- 原问题：查看今天茅台价格
+   重写后：A股 贵州茅台 今日 实时价格
+
+- 原问题：宁德时代怎么样
+   重写后：A股 宁德时代 最近30天 K线与资金流
+
+- 原问题：恒生科技指数走势
+   重写后：港股 恒生科技指数 最近30天 日线走势
 
 | 类型 | 示例问法 |
 |------|----------|
