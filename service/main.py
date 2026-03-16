@@ -74,6 +74,7 @@ class IntentRequest(BaseModel):
     intent: str
     query: str = ""
     symbol: Optional[str] = None
+    target: Optional[str] = None
     date: Optional[str] = None
     period: Optional[str] = None
     top_n: Optional[int] = None
@@ -83,19 +84,21 @@ class IntentRequest(BaseModel):
 # 分发逻辑
 # ---------------------------------------------------------------------------
 def dispatch(req: IntentRequest, adapter: AkshareAdapter) -> Dict[str, Any]:
+    subject = req.symbol or req.target
+
     if req.intent == INDEX_REALTIME:
         return adapter.index_spot(top_n=300)
 
     if req.intent == KLINE_ANALYSIS:
         top_n = req.top_n or 10
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": KLINE_ANALYSIS}
         period = req.period or "daily"
         return adapter.stock_kline(symbol=symbol, period=period, top_n=top_n, query=req.query)
 
     if req.intent == KLINE_CHART:
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": KLINE_CHART}
         period = req.period or "daily"
@@ -104,28 +107,28 @@ def dispatch(req: IntentRequest, adapter: AkshareAdapter) -> Dict[str, Any]:
 
     if req.intent == INTRADAY_ANALYSIS:
         top_n = req.top_n or 30
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": INTRADAY_ANALYSIS}
         period = req.period if req.period in {"1", "5", "15", "30", "60"} else "1"
-        return adapter.stock_intraday(symbol=symbol, period=period, top_n=top_n)
+        return adapter.stock_intraday(symbol=symbol, period=period, top_n=top_n, query=req.query)
 
     if req.intent == VOLUME_ANALYSIS:
         # 直接复用 stock_intraday 提供分时数据供分析
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": VOLUME_ANALYSIS}
-        return adapter.stock_intraday(symbol=symbol, period="1", top_n=60)
+        return adapter.stock_intraday(symbol=symbol, period="1", top_n=60, query=req.query)
 
     if req.intent == LIMIT_STATS:
         top_n = req.top_n or 20
         return adapter.limit_pool(date=req.date, top_n=top_n)
 
     if req.intent == STOCK_OVERVIEW:
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票代码或名称", "intent": STOCK_OVERVIEW}
-        return adapter.stock_overview(symbol=symbol)
+        return adapter.stock_overview(symbol=symbol, query=req.query)
 
     if req.intent == MONEY_FLOW:
         top_n = req.top_n or 10
@@ -134,17 +137,17 @@ def dispatch(req: IntentRequest, adapter: AkshareAdapter) -> Dict[str, Any]:
             return adapter.market_money_flow(top_n=top_n, date=req.date)
         if any(k in query for k in ["行业资金", "板块资金", "行业流入", "板块流入"]):
             return adapter.sector_money_flow(top_n=top_n)
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票代码或名称", "intent": MONEY_FLOW}
-        return adapter.money_flow(symbol=symbol, top_n=top_n)
+        return adapter.money_flow(symbol=symbol, top_n=top_n, query=req.query)
 
     if req.intent == FUNDAMENTAL:
         top_n = req.top_n or 20
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票代码或名称", "intent": FUNDAMENTAL}
-        return adapter.fundamental(symbol=symbol, top_n=top_n)
+        return adapter.fundamental(symbol=symbol, top_n=top_n, query=req.query)
 
     if req.intent == MARGIN_LHB:
         top_n = req.top_n or 10
@@ -156,10 +159,10 @@ def dispatch(req: IntentRequest, adapter: AkshareAdapter) -> Dict[str, Any]:
 
     if req.intent == RESEARCH_REPORT:
         top_n = min(req.top_n or 10, 10)
-        symbol = req.symbol
+        symbol = subject
         if not symbol:
             return {"ok": False, "error": "请输入股票代码或名称", "intent": RESEARCH_REPORT}
-        return adapter.research_report(symbol=symbol, top_n=top_n)
+        return adapter.research_report(symbol=symbol, top_n=top_n, query=req.query)
 
     if req.intent == STOCK_PICK:
         query = req.query or ""
@@ -188,20 +191,20 @@ def dispatch(req: IntentRequest, adapter: AkshareAdapter) -> Dict[str, Any]:
         top_n = req.top_n or 10
         query = (req.query or "").lower()
         scope = "bond" if any(k in query for k in ["可转债", "转债", "债"]) else "fund"
-        return adapter.fund_bond(scope=scope, symbol=req.symbol, top_n=top_n)
+        return adapter.fund_bond(scope=scope, symbol=subject, top_n=top_n)
 
     if req.intent == HK_US_MARKET:
         top_n = req.top_n or 10
         query = (req.query or "").lower()
         us_tokens = ["美股", "nasdaq", "dow", "道琼斯", "标普", "sp500", "s&p", "纳指", "us"]
         market = "us" if any(t in query for t in us_tokens) else "hk"
-        return adapter.hk_us_market(market=market, top_n=top_n, symbol=req.symbol)
+        return adapter.hk_us_market(market=market, top_n=top_n, symbol=subject, query=req.query)
 
     if req.intent == DERIVATIVES:
         top_n = req.top_n or 10
         query = req.query or ""
         scope = "options" if any(k in query for k in ["期权", "option", "Option", "OPTIONS"]) else "futures"
-        return adapter.derivatives(scope=scope, symbol=req.symbol, top_n=top_n)
+        return adapter.derivatives(scope=scope, symbol=subject, top_n=top_n)
 
     if req.intent in (HELP, PORTFOLIO):
         return {

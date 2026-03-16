@@ -272,6 +272,130 @@ class AkshareAdapter:
             return s.zfill(5)
         return s
 
+    def _is_explicit_symbol(self, symbol: str) -> bool:
+        s = str(symbol or "").strip()
+        if not s:
+            return False
+        if s.isdigit() and len(s) in {5, 6}:
+            return True
+        if s.upper().startswith("HK") and s[2:].isdigit():
+            return True
+        if len(s) == 6 and s.lower().startswith(("sh", "sz", "bj")):
+            return True
+        if "." in s and any(ch.isdigit() for ch in s.split(".", 1)[0]):
+            return True
+        if s.upper() == s and any(ch.isalpha() for ch in s):
+            return True
+        return False
+
+    def _match_target_in_records(
+        self,
+        records: list[dict],
+        target: str,
+        return_keys: list[str],
+        match_keys: list[str],
+    ) -> str:
+        if not target or not isinstance(records, list):
+            return ""
+
+        target_norm = str(target).strip().lower()
+        if not target_norm:
+            return ""
+
+        def pick_value(row: dict) -> str:
+            for key in return_keys:
+                value = row.get(key)
+                if value not in (None, ""):
+                    return str(value).strip()
+            return ""
+
+        exact_hits: list[str] = []
+        fuzzy_hits: list[str] = []
+        for row in records:
+            if not isinstance(row, dict):
+                continue
+            for key in match_keys:
+                value = row.get(key)
+                if value in (None, ""):
+                    continue
+                value_norm = str(value).strip().lower()
+                if value_norm == target_norm:
+                    picked = pick_value(row)
+                    if picked:
+                        exact_hits.append(picked)
+                    break
+                if target_norm in value_norm or value_norm in target_norm:
+                    picked = pick_value(row)
+                    if picked:
+                        fuzzy_hits.append(picked)
+                    break
+
+        if exact_hits:
+            return exact_hits[0]
+        if fuzzy_hits:
+            return fuzzy_hits[0]
+        return ""
+
+    def _resolve_symbol_with_akshare(self, symbol: Optional[str], query: str = "") -> str:
+        raw = str(symbol or "").strip()
+        if not raw:
+            return ""
+
+        if self._is_explicit_symbol(raw):
+            return raw
+
+        q = query or ""
+        q_lower = q.lower()
+        target = raw.strip()
+        market_hints = {
+            "hk": any(k in q for k in ["港股", "恒生", "恒指"]),
+            "us": any(k in q_lower for k in ["美股", "nasdaq", "dow", "spx", "标普", "道琼斯", "纳指", "us"]),
+            "index": any(k in q for k in ["指数", "大盘"]),
+        }
+
+        search_plan: list[tuple[str, list[dict], list[str]]] = []
+        if market_hints["hk"]:
+            search_plan.extend([
+                ("stock_hk_spot_em", [{}], ["代码"]),
+                ("stock_hk_main_board_spot_em", [{}], ["代码"]),
+            ])
+        if market_hints["us"]:
+            search_plan.extend([
+                ("stock_us_spot_em", [{}], ["代码"]),
+                ("stock_us_famous_spot_em", [{"symbol": "科技类"}, {"symbol": "金融类"}, {"symbol": "医药食品类"}, {"symbol": "媒体类"}, {"symbol": "汽车能源类"}, {"symbol": "制造零售类"}], ["代码"]),
+            ])
+        if market_hints["index"] or not (market_hints["hk"] or market_hints["us"]):
+            search_plan.extend([
+                ("stock_zh_index_spot_em", [{}], ["代码", "symbol"]),
+                ("stock_zh_index_spot_sina", [{}], ["代码", "symbol"]),
+                ("index_global_spot_em", [{}], ["代码", "symbol", "指数代码"]),
+            ])
+        if not (market_hints["hk"] or market_hints["us"]):
+            search_plan.extend([
+                ("stock_info_a_code_name", [{}], ["code", "代码"]),
+                ("stock_zh_a_spot_em", [{}], ["代码"]),
+                ("stock_sh_a_spot_em", [{}], ["代码"]),
+                ("stock_sz_a_spot_em", [{}], ["代码"]),
+                ("stock_bj_a_spot_em", [{}], ["代码"]),
+            ])
+
+        match_keys = ["名称", "name", "证券简称", "股票简称", "中文名称", "代码", "code", "symbol", "指数名称", "简称"]
+
+        for fn_name, kwargs_list, return_keys in search_plan:
+            func = getattr(self._ak, fn_name, None)
+            if func is None:
+                continue
+            for kwargs in kwargs_list or [{}]:
+                result, error = self._call_with_retries(fn_name=fn_name, func=func, kwargs=kwargs)
+                if error is not None:
+                    continue
+                records = self._to_records(result, top_n=10000)
+                matched = self._match_target_in_records(records, target=target, return_keys=return_keys, match_keys=match_keys)
+                if matched:
+                    return matched
+
+        return raw
+
     def _filter_records_by_symbol(self, records: list[dict], symbol: str) -> list[dict]:
         if not symbol:
             return records
@@ -413,30 +537,14 @@ class AkshareAdapter:
     def _index_name_candidates(self, symbol: str, query: str) -> list[str]:
         raw = (symbol or "").strip()
         raw_upper = raw.upper()
-        q = query or ""
-
-        alias_map = {
-            "HSTECH": ["恒生科技指数", "恒生科技"],
-            "HSI": ["恒生指数", "恒生"],
-            "IXIC": ["纳斯达克综合指数", "纳斯达克"],
-            "DJI": ["道琼斯工业平均指数", "道琼斯"],
-            "SPX": ["标普500指数", "标普500", "标普"],
-        }
 
         names: list[str] = []
-        if raw_upper in alias_map:
-            names.extend(alias_map[raw_upper])
-
-        if "恒生科技" in q:
-            names.extend(alias_map["HSTECH"])
-        if "恒生指数" in q or "恒指" in q:
-            names.extend(alias_map["HSI"])
-        if "纳斯达克" in q or "纳指" in q:
-            names.extend(alias_map["IXIC"])
-        if "道琼斯" in q:
-            names.extend(alias_map["DJI"])
-        if "标普" in q:
-            names.extend(alias_map["SPX"])
+        if raw_upper:
+            names.append(raw_upper)
+        if raw_upper.startswith("^"):
+            names.append(raw_upper[1:])
+        if raw_upper.startswith("HK") and raw_upper[2:].isdigit():
+            names.append(raw_upper[2:].zfill(5))
 
         # De-duplicate while preserving order.
         uniq: list[str] = []
@@ -612,6 +720,7 @@ class AkshareAdapter:
             start = start_date.replace("-", "")
 
         end = self._normalize_trade_date(end_date)
+        symbol = self._resolve_symbol_with_akshare(symbol, query=query or "")
 
         try:
             used_fn, df, error = self._fetch_kline_df(symbol=symbol, period=period, start=start, end=end, query=query)
@@ -667,6 +776,7 @@ class AkshareAdapter:
             start_dt = end_dt - timedelta(days=days + 50)
             start = start_dt.strftime("%Y%m%d")
             end = end_dt.strftime("%Y%m%d")
+            symbol = self._resolve_symbol_with_akshare(symbol, query=query or "")
 
             used_fn, df, error = self._fetch_kline_df(symbol=symbol, period=period, start=start, end=end, query=query)
             if used_fn is None:
@@ -748,12 +858,13 @@ class AkshareAdapter:
         except Exception as exc:
             return self._error(fn_name, str(exc))
 
-    def stock_intraday(self, symbol: str, period: str = "1", top_n: int = 30) -> Dict[str, Any]:
+    def stock_intraday(self, symbol: str, period: str = "1", top_n: int = 30, query: str = "") -> Dict[str, Any]:
         fn_name = "stock_intraday_em"
         err = self._ready_or_error(fn_name)
         if err:
             return err
 
+        symbol = self._resolve_symbol_with_akshare(symbol, query=query)
         clean_symbol = self._clean_symbol(symbol)
         prefixed_symbol = self._to_prefixed_a_symbol(clean_symbol)
         hk_symbol = self._to_hk_symbol(symbol)
@@ -808,12 +919,13 @@ class AkshareAdapter:
 
         return self._wrap(used_fn, date=trade_date, items=self._to_records(df, top_n=top_n))
 
-    def stock_overview(self, symbol: str) -> Dict[str, Any]:
+    def stock_overview(self, symbol: str, query: str = "") -> Dict[str, Any]:
         fn_name = "stock_individual_info_em"
         err = self._ready_or_error(fn_name)
         if err:
             return err
 
+        symbol = self._resolve_symbol_with_akshare(symbol, query=query)
         symbol = self._clean_symbol(symbol)
 
         results: Dict[str, Any] = {}
@@ -834,12 +946,13 @@ class AkshareAdapter:
 
         return self._wrap(fn_name, symbol=symbol, **results)
 
-    def money_flow(self, symbol: str, top_n: int = 10) -> Dict[str, Any]:
+    def money_flow(self, symbol: str, top_n: int = 10, query: str = "") -> Dict[str, Any]:
         fn_name = "stock_individual_fund_flow"
         err = self._ready_or_error(fn_name)
         if err:
             return err
 
+        symbol = self._resolve_symbol_with_akshare(symbol, query=query)
         symbol = self._clean_symbol(symbol)
         market = self._market_from_symbol(symbol)
 
@@ -891,12 +1004,13 @@ class AkshareAdapter:
 
         return self._wrap(used_fn, items=self._to_records(df, top_n=top_n))
 
-    def fundamental(self, symbol: str, top_n: int = 20) -> Dict[str, Any]:
+    def fundamental(self, symbol: str, top_n: int = 20, query: str = "") -> Dict[str, Any]:
         fn_name = "stock_financial_abstract_ths"
         err = self._ready_or_error(fn_name)
         if err:
             return err
 
+        symbol = self._resolve_symbol_with_akshare(symbol, query=query)
         symbol = self._clean_symbol(symbol)
         em_symbol = self._to_em_a_symbol(symbol)
 
@@ -985,12 +1099,13 @@ class AkshareAdapter:
 
         return self._wrap(used_fn, items=self._to_records(df, top_n=top_n))
 
-    def research_report(self, symbol: str, top_n: int = 10) -> Dict[str, Any]:
+    def research_report(self, symbol: str, top_n: int = 10, query: str = "") -> Dict[str, Any]:
         fn_name = "stock_research_report_em"
         err = self._ready_or_error(fn_name)
         if err:
             return err
 
+        symbol = self._resolve_symbol_with_akshare(symbol, query=query)
         symbol = self._clean_symbol(symbol)
 
         candidates = [
@@ -1073,11 +1188,13 @@ class AkshareAdapter:
 
         return self._wrap(used_fn, scope=scope, items=self._to_records(df, top_n=top_n))
 
-    def hk_us_market(self, market: str = "hk", top_n: int = 10, symbol: Optional[str] = None) -> Dict[str, Any]:
+    def hk_us_market(self, market: str = "hk", top_n: int = 10, symbol: Optional[str] = None, query: str = "") -> Dict[str, Any]:
         fn_name = "stock_hk_spot_em"
         err = self._ready_or_error(fn_name)
         if err:
             return err
+
+        resolved_symbol = self._resolve_symbol_with_akshare(symbol, query=query) if symbol else None
 
         if market == "us":
             candidates = [
@@ -1093,13 +1210,13 @@ class AkshareAdapter:
             return self._error(fn_name, error)
 
         records = self._to_records(df, top_n=top_n * 5)
-        if symbol and isinstance(records, list):
-            filtered = self._filter_records_by_symbol(records, symbol)
+        if resolved_symbol and isinstance(records, list):
+            filtered = self._filter_records_by_symbol(records, resolved_symbol)
             records = filtered[:top_n] if filtered else records[:top_n]
         elif isinstance(records, list):
             records = records[:top_n]
 
-        return self._wrap(used_fn, market=market, items=records)
+        return self._wrap(used_fn, market=market, symbol=resolved_symbol, items=records)
 
     def derivatives(self, scope: str = "futures", symbol: Optional[str] = None, top_n: int = 10) -> Dict[str, Any]:
         fn_name = "futures_main_sina"

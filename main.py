@@ -58,6 +58,7 @@ def call_service(service_url: str, intent_obj: IntentObj, timeout: int = DEFAULT
         "intent": intent_obj.intent,
         "query": intent_obj.query or "",
         "symbol": intent_obj.symbol,
+        "target": intent_obj.target,
         "date": intent_obj.date,
         "period": intent_obj.period,
         "top_n": intent_obj.top_n,
