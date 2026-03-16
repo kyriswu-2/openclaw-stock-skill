@@ -24,6 +24,8 @@ class AkshareAdapter:
     _proxy_patch_lock = threading.Lock()
     _proxy_patch_installed = False
     _request_ctx = threading.local()
+    _symbol_cache_thread_lock = threading.Lock()
+    _symbol_cache_thread_started = False
 
     def __init__(self) -> None:
         self._proxy_url = os.getenv("AKSHARE_PROXY_URL", "http://umwhniat-rotate:eudczfs5mkzt@p.webshare.io:80/").strip()
@@ -38,6 +40,11 @@ class AkshareAdapter:
         self._proxy_fetch_backoff_ms = max(0, int(os.getenv("AKSHARE_PROXY_FETCH_BACKOFF_MS", "300")))
         self._api_call_retries = max(1, int(os.getenv("AKSHARE_API_RETRIES", "3")))
         self._api_call_backoff_ms = max(0, int(os.getenv("AKSHARE_API_BACKOFF_MS", "400")))
+        self._symbol_cache_ttl_sec = max(60, int(os.getenv("AKSHARE_SYMBOL_CACHE_TTL_SEC", "1800")))
+        self._symbol_cache_refresh_sec = max(60, int(os.getenv("AKSHARE_SYMBOL_CACHE_REFRESH_SEC", "900")))
+        self._symbol_cache_preload = os.getenv("AKSHARE_SYMBOL_CACHE_PRELOAD", "1").lower() not in {"0", "false", "no"}
+        self._symbol_lookup_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._symbol_lookup_cache_lock = threading.Lock()
 
         self._configure_proxy_logger()
         self._install_dynamic_proxy_for_requests()
@@ -50,6 +57,8 @@ class AkshareAdapter:
             self._ak = ak
         except Exception as exc:
             self._import_error = str(exc)
+
+        self._start_symbol_cache_refresher()
 
     def _configure_proxy_logger(self) -> None:
         if not logger.handlers:
@@ -114,6 +123,113 @@ class AkshareAdapter:
         raise RuntimeError(
             f"proxy api failed after {self._proxy_fetch_retries} attempts: {last_exc}"
         )
+
+    def _symbol_cache_key(self, fn_name: str, kwargs: dict) -> str:
+        return f"{fn_name}|{json.dumps(kwargs or {}, sort_keys=True, ensure_ascii=False)}"
+
+    def _get_symbol_records_from_cache(self, fn_name: str, kwargs: dict) -> Optional[list[dict]]:
+        cache_key = self._symbol_cache_key(fn_name, kwargs)
+        now = time.time()
+        with self._symbol_lookup_cache_lock:
+            cached = self._symbol_lookup_cache.get(cache_key)
+            if not cached:
+                return None
+            ts, records = cached
+            if now - ts > self._symbol_cache_ttl_sec:
+                self._symbol_lookup_cache.pop(cache_key, None)
+                return None
+            return records
+
+    def _set_symbol_records_cache(self, fn_name: str, kwargs: dict, records: list[dict]) -> None:
+        cache_key = self._symbol_cache_key(fn_name, kwargs)
+        with self._symbol_lookup_cache_lock:
+            self._symbol_lookup_cache[cache_key] = (time.time(), records)
+
+    def _fetch_symbol_records(self, fn_name: str, kwargs: Optional[dict] = None) -> tuple[Optional[list[dict]], Optional[str]]:
+        if self._ak is None:
+            return None, "akshare unavailable"
+
+        call_kwargs = kwargs or {}
+        cached = self._get_symbol_records_from_cache(fn_name, call_kwargs)
+        if cached is not None:
+            return cached, None
+
+        func = getattr(self._ak, fn_name, None)
+        if func is None:
+            return None, f"{fn_name} not found"
+
+        result, error = self._call_with_retries(fn_name=fn_name, func=func, kwargs=call_kwargs)
+        if error is not None:
+            return None, error
+
+        records = self._to_records(result, top_n=10000)
+        if not isinstance(records, list):
+            return None, f"{fn_name} returned non-list records"
+
+        self._set_symbol_records_cache(fn_name, call_kwargs, records)
+        return records, None
+
+    def _build_symbol_preload_plan(self) -> list[tuple[str, list[dict]]]:
+        return [
+            ("stock_info_a_code_name", [{}]),
+            ("stock_zh_a_spot_em", [{}]),
+            ("stock_hk_spot_em", [{}]),
+            ("stock_us_spot_em", [{}]),
+            ("stock_zh_index_spot_em", [{}]),
+            ("stock_zh_index_spot_sina", [{}]),
+            (
+                "stock_us_famous_spot_em",
+                [
+                    {"symbol": "科技类"},
+                    {"symbol": "金融类"},
+                    {"symbol": "医药食品类"},
+                    {"symbol": "媒体类"},
+                    {"symbol": "汽车能源类"},
+                    {"symbol": "制造零售类"},
+                ],
+            ),
+        ]
+
+    def _refresh_symbol_cache_once(self) -> None:
+        if self._ak is None:
+            return
+
+        for fn_name, kwargs_list in self._build_symbol_preload_plan():
+            for kwargs in kwargs_list:
+                _, error = self._fetch_symbol_records(fn_name, kwargs)
+                if error and self._proxy_log_enabled:
+                    logger.warning("symbol_cache_refresh_failed api=%s kwargs=%s error=%s", fn_name, kwargs, error)
+
+    def _symbol_cache_refresh_loop(self) -> None:
+        if self._proxy_log_enabled:
+            logger.info(
+                "symbol_cache_refresh_started ttl_sec=%s refresh_sec=%s",
+                self._symbol_cache_ttl_sec,
+                self._symbol_cache_refresh_sec,
+            )
+
+        while True:
+            try:
+                self._refresh_symbol_cache_once()
+            except Exception as exc:
+                if self._proxy_log_enabled:
+                    logger.warning("symbol_cache_refresh_loop_error error=%s", exc)
+            time.sleep(self._symbol_cache_refresh_sec)
+
+    def _start_symbol_cache_refresher(self) -> None:
+        if not self._symbol_cache_preload or self._ak is None:
+            return
+
+        if AkshareAdapter._symbol_cache_thread_started:
+            return
+
+        with AkshareAdapter._symbol_cache_thread_lock:
+            if AkshareAdapter._symbol_cache_thread_started:
+                return
+
+            thread = threading.Thread(target=self._symbol_cache_refresh_loop, name="akshare-symbol-cache", daemon=True)
+            thread.start()
+            AkshareAdapter._symbol_cache_thread_started = True
 
     def _install_dynamic_proxy_for_requests(self) -> None:
         if AkshareAdapter._proxy_patch_installed:
@@ -324,16 +440,33 @@ class AkshareAdapter:
         s = str(symbol or "").strip()
         if not s:
             return False
+
+        s_upper = s.upper()
+        s_lower = s.lower()
+
+        # A/HK numeric codes, e.g. 600519 / 00700 / HK00700.
         if s.isdigit() and len(s) in {5, 6}:
             return True
-        if s.upper().startswith("HK") and s[2:].isdigit():
+        if s_upper.startswith("HK") and s_upper[2:].isdigit() and len(s_upper[2:]) in {4, 5}:
             return True
-        if len(s) == 6 and s.lower().startswith(("sh", "sz", "bj")):
+        if s_lower.startswith(("sh", "sz", "bj")) and len(s) == 8 and s[2:].isdigit():
             return True
-        if "." in s and any(ch.isdigit() for ch in s.split(".", 1)[0]):
+
+        # US and cross-market code styles, e.g. BRK.A / 105.TTE / TSLA.
+        if "." in s:
+            left, right = s.split(".", 1)
+            if left and right and left.replace("-", "").isalnum() and right.replace("-", "").isalnum():
+                return True
+
+        if any(ord(ch) > 127 for ch in s):
+            return False
+
+        if any(ch.isspace() for ch in s):
+            return False
+
+        if any(ch.isalpha() for ch in s) and all(ch.isalnum() or ch in {".", "-", "_"} for ch in s):
             return True
-        if s.upper() == s and any(ch.isalpha() for ch in s):
-            return True
+
         return False
 
     def _match_target_in_records(
@@ -430,14 +563,10 @@ class AkshareAdapter:
         match_keys = ["名称", "name", "证券简称", "股票简称", "中文名称", "代码", "code", "symbol", "指数名称", "简称"]
 
         for fn_name, kwargs_list, return_keys in search_plan:
-            func = getattr(self._ak, fn_name, None)
-            if func is None:
-                continue
             for kwargs in kwargs_list or [{}]:
-                result, error = self._call_with_retries(fn_name=fn_name, func=func, kwargs=kwargs)
+                records, error = self._fetch_symbol_records(fn_name=fn_name, kwargs=kwargs)
                 if error is not None:
                     continue
-                records = self._to_records(result, top_n=10000)
                 matched = self._match_target_in_records(records, target=target, return_keys=return_keys, match_keys=match_keys)
                 if matched:
                     return matched

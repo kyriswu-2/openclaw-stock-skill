@@ -37,6 +37,13 @@ python3 main.py --query "上证指数实时行情"
 - 服务端地址固定走公共服务 `https://akshare.devtool.uk`
 - 用户只需要像聊天一样输入问题，不需要关心服务部署
 
+性能建议：如果用户已经给出明确代码（如 `600519`、`AAPL`、`BRK.A`、`HK00700`），优先保留代码执行。服务端会跳过全量名称列表匹配，减少不必要的网络请求。
+
+## 自建服务代理注意事项
+
+- `AKSHARE_PROXY_URL` 推荐使用 `http://...` 代理地址（当前仓库默认也是 http）。
+- 如果使用 `socks5://...`，需要额外安装 SOCKS 依赖（例如 `requests[socks]`/`PySocks`），否则会出现 `Missing dependencies for SOCKS support`。
+
 ## 文件说明
 
 | 文件/目录 | 说明 |

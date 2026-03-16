@@ -1,13 +1,13 @@
 ---
 name: akshare-api
-description: Use this skill when the user wants Chinese stock market data or analysis, including A-share行情、上证/深证/创业板指数、个股K线、涨跌停统计、资金流向、基本面、板块表现、港股美股行情、基金可转债、财经新闻和研报。 The skill runs the local client at main.py and sends the query to the hosted Akshare service at https://akshare.devtool.uk. Prefer this skill for direct market data lookups in Chinese.
+description: Use this skill when the user wants Chinese stock market data or analysis, including A-share行情、上证/深证/创业板指数、个股K线、涨跌停统计、资金流向、基本面、板块表现、港股美股行情、基金可转债、财经新闻和研报。 The skill runs the local client at main.py and sends the query to the default Akshare service. Prefer this skill for direct market data lookups in Chinese.
 metadata:
   version: 1.0.0
 ---
 
 # Akshare API
 
-这个 skill 用来处理中文股票数据查询。调用方式是：先对用户问题做最小必要拆解（识别意图、标的、时间范围、指标），再把“保留原意”的查询语句交给本地客户端，由客户端路由意图并请求固定云端服务 `https://akshare.devtool.uk`。
+这个 skill 用来处理中文股票数据查询。调用方式是：先对用户问题做最小必要拆解（识别意图、标的、时间范围、指标），再把“保留原意”的查询语句交给本地客户端，由客户端路由意图并请求默认数据服务。
 
 重要原则：
 
@@ -52,7 +52,7 @@ python3 main.py --query "<拆解后、保留原意的查询语句>"
 
 默认假设当前工作目录就是本仓库根目录，大模型可以据此推断相对路径执行。
 
-不要要求用户配置 `--service-url`，也不要要求用户部署服务。服务地址已经固定使用线上地址：`https://akshare.devtool.uk`。
+不要要求用户配置额外服务参数，也不要要求用户部署服务。默认配置即可直接使用。
 
 ## Question Decomposition Rules
 
@@ -96,6 +96,7 @@ python3 main.py --query "<拆解后、保留原意的查询语句>"
 - 优先保留用户原始表述，不要过度改写。
 - 先拆解再执行，改写只做“最小必要补全”。
 - 如果用户已经给出股票名称或代码，优先规范化后执行。
+- 如果用户给的是明确代码（如 `600519`、`00700`、`HK00700`、`AAPL`、`BRK.A`），优先直接透传代码；运行时会跳过全量列表匹配以减少无意义请求。
 - 如果请求依赖具体股票但用户没给标的，先追问股票名称或代码。
 - 如果用户问题同时包含多个任务，拆成顺序执行的子问题，并按“先行情后分析”返回。
 - 如果执行过程中存在不确定项（例如：名称映射、指数别名、交易所代码、接口可用性），先调用可用的搜索能力进行确认，再继续执行。优先顺序：
@@ -141,6 +142,7 @@ skill 在执行前应优先做这些规范化：
 - 港股代码：统一为 5 位数字（如 `00700`），若用户给 `HK0700` 需自动转换为 `00700`。
 - 美股代码：优先用交易代码（如 `AAPL`、`NVDA`）。
 - 美股东财代码（如 `105.TTE`）在历史行情场景可直接透传。
+- 当输入已是“明确代码形态”时，运行时不再做全量名称列表匹配，以降低网络请求和代理压力。
 - 东财系历史接口常见参数：
    - `period`: `daily|weekly|monthly` 或分钟周期。
    - `adjust`: `""|qfq|hfq`（当接口支持时）。

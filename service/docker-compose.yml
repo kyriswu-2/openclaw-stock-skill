@@ -23,6 +23,9 @@ services:
       - AKSHARE_PROXY_FETCH_BACKOFF_MS=300
       - AKSHARE_API_RETRIES=3
       - AKSHARE_API_BACKOFF_MS=400
+      - AKSHARE_SYMBOL_CACHE_PRELOAD=1
+      - AKSHARE_SYMBOL_CACHE_TTL_SEC=1800
+      - AKSHARE_SYMBOL_CACHE_REFRESH_SEC=900
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
