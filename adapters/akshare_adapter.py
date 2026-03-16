@@ -23,6 +23,7 @@ logger = logging.getLogger("akshare_proxy")
 class AkshareAdapter:
     _proxy_patch_lock = threading.Lock()
     _proxy_patch_installed = False
+    _request_ctx = threading.local()
 
     def __init__(self) -> None:
         self._proxy_url = os.getenv("AKSHARE_PROXY_URL", "").strip()
@@ -31,12 +32,14 @@ class AkshareAdapter:
         self._proxy_auth_pwd = os.getenv("AKSHARE_PROXY_AUTH_PWD", "5C2D184F943D")
         self._proxy_strict = os.getenv("AKSHARE_PROXY_STRICT", "1").lower() not in {"0", "false", "no"}
         self._proxy_log_enabled = os.getenv("AKSHARE_PROXY_LOG", "1").lower() not in {"0", "false", "no"}
+        self._proxy_log_level = os.getenv("AKSHARE_PROXY_LOG_LEVEL", "INFO").strip().upper() or "INFO"
         self._proxy_fetch_timeout = float(os.getenv("AKSHARE_PROXY_FETCH_TIMEOUT", "8"))
         self._proxy_fetch_retries = max(1, int(os.getenv("AKSHARE_PROXY_FETCH_RETRIES", "3")))
         self._proxy_fetch_backoff_ms = max(0, int(os.getenv("AKSHARE_PROXY_FETCH_BACKOFF_MS", "300")))
         self._api_call_retries = max(1, int(os.getenv("AKSHARE_API_RETRIES", "3")))
         self._api_call_backoff_ms = max(0, int(os.getenv("AKSHARE_API_BACKOFF_MS", "400")))
 
+        self._configure_proxy_logger()
         self._install_dynamic_proxy_for_requests()
 
         self._ak = None
@@ -47,6 +50,16 @@ class AkshareAdapter:
             self._ak = ak
         except Exception as exc:
             self._import_error = str(exc)
+
+    def _configure_proxy_logger(self) -> None:
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+            logger.addHandler(handler)
+
+        level = getattr(logging, self._proxy_log_level, logging.INFO)
+        logger.setLevel(level if self._proxy_log_enabled else logging.WARNING)
+        logger.propagate = False
 
     def _build_proxy_dict(self) -> tuple[Dict[str, str], Dict[str, str]]:
         if not self._proxy_api or not self._proxy_auth_key or not self._proxy_auth_pwd:
@@ -214,6 +227,11 @@ class AkshareAdapter:
                         proxy_api_host,
                         strict_mode,
                     )
+
+                AkshareAdapter._request_ctx.target_host = target_host
+                AkshareAdapter._request_ctx.proxy_mode = selected_mode
+                AkshareAdapter._request_ctx.selected_proxy = selected_proxy
+                AkshareAdapter._request_ctx.proxy_api = proxy_api_host
 
                 return original_request(session, method, url, **kwargs)
 
@@ -470,12 +488,20 @@ class AkshareAdapter:
                 last_error = str(exc)
                 retryable = self._is_retryable_exception(exc)
                 if self._proxy_log_enabled:
+                    proxy_mode = getattr(AkshareAdapter._request_ctx, "proxy_mode", "unknown")
+                    selected_proxy = getattr(AkshareAdapter._request_ctx, "selected_proxy", "")
+                    proxy_api = getattr(AkshareAdapter._request_ctx, "proxy_api", "")
+                    target_host = getattr(AkshareAdapter._request_ctx, "target_host", "")
                     logger.warning(
-                        "akshare_api_call_failed api=%s attempt=%s/%s retryable=%s error=%s",
+                        "akshare_api_call_failed api=%s attempt=%s/%s retryable=%s proxy_mode=%s selected_proxy=%s proxy_api=%s target=%s error=%s",
                         fn_name,
                         attempt,
                         self._api_call_retries,
                         retryable,
+                        proxy_mode,
+                        selected_proxy,
+                        proxy_api,
+                        target_host,
                         exc,
                     )
 
