@@ -3,13 +3,16 @@
 
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
+import socket
 from io import StringIO
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 from typing import Any, Dict, Optional
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -31,6 +34,8 @@ class AkshareAdapter:
         self._proxy_fetch_timeout = float(os.getenv("AKSHARE_PROXY_FETCH_TIMEOUT", "8"))
         self._proxy_fetch_retries = max(1, int(os.getenv("AKSHARE_PROXY_FETCH_RETRIES", "3")))
         self._proxy_fetch_backoff_ms = max(0, int(os.getenv("AKSHARE_PROXY_FETCH_BACKOFF_MS", "300")))
+        self._api_call_retries = max(1, int(os.getenv("AKSHARE_API_RETRIES", "3")))
+        self._api_call_backoff_ms = max(0, int(os.getenv("AKSHARE_API_BACKOFF_MS", "400")))
 
         self._install_dynamic_proxy_for_requests()
 
@@ -272,13 +277,100 @@ class AkshareAdapter:
 
             args_pool = kwargs_list or [{}]
             for kwargs in args_pool:
-                try:
-                    result = func(**kwargs)
+                result, error = self._call_with_retries(fn_name=fn_name, func=func, kwargs=kwargs)
+                if error is None:
                     return fn_name, result, ""
-                except Exception as exc:
-                    errors.append(f"{fn_name}({kwargs}): {exc}")
+                errors.append(error)
 
         return None, None, "; ".join(errors) if errors else "no callable api found"
+
+    def _call_with_retries(self, fn_name: str, func: Any, kwargs: Optional[dict] = None) -> tuple[Any, Optional[str]]:
+        args = kwargs or {}
+        last_error = ""
+
+        for attempt in range(1, self._api_call_retries + 1):
+            try:
+                return func(**args), None
+            except Exception as exc:
+                last_error = str(exc)
+                retryable = self._is_retryable_exception(exc)
+                if self._proxy_log_enabled:
+                    logger.warning(
+                        "akshare_api_call_failed api=%s attempt=%s/%s retryable=%s error=%s",
+                        fn_name,
+                        attempt,
+                        self._api_call_retries,
+                        retryable,
+                        exc,
+                    )
+
+                if not retryable:
+                    return None, f"{fn_name}({args}) non-retryable: {last_error}"
+
+                if attempt < self._api_call_retries and self._api_call_backoff_ms > 0:
+                    time.sleep(self._api_call_backoff_ms / 1000)
+
+        return None, f"{fn_name}({args}) retries={self._api_call_retries}: {last_error}"
+
+    def _is_retryable_exception(self, exc: Exception) -> bool:
+        # 常见网络层异常：连接超时、代理失败、DNS 失败、TLS 失败等。
+        retryable_types: tuple[type, ...] = (
+            TimeoutError,
+            ConnectionError,
+            socket.timeout,
+            socket.gaierror,
+            URLError,
+            ssl.SSLError,
+        )
+        if isinstance(exc, retryable_types):
+            return True
+
+        # HTTPError 中，5xx/429 更可能是临时性故障；4xx 参数类错误不重试。
+        if isinstance(exc, HTTPError):
+            return exc.code >= 500 or exc.code == 429
+
+        # requests 异常（akshare 主要经 requests 发起 HTTP）
+        try:
+            import requests  # type: ignore
+
+            req_retryable_types = (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ProxyError,
+                requests.exceptions.SSLError,
+            )
+            if isinstance(exc, req_retryable_types):
+                return True
+
+            if isinstance(exc, requests.exceptions.HTTPError):
+                status = None
+                if getattr(exc, "response", None) is not None:
+                    status = getattr(exc.response, "status_code", None)
+                return status == 429 or (isinstance(status, int) and status >= 500)
+        except Exception:
+            pass
+
+        # 第三方库有时会重新包装异常，这里兜底关键词匹配网络类故障。
+        msg = str(exc).lower()
+        network_markers = [
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "temporary failure",
+            "connection aborted",
+            "connection reset",
+            "connection refused",
+            "max retries exceeded",
+            "failed to establish a new connection",
+            "name or service not known",
+            "nodename nor servname",
+            "proxyerror",
+            "unable to connect to proxy",
+            "remote end closed connection",
+            "ssl",
+            "tls",
+        ]
+        return any(marker in msg for marker in network_markers)
 
     def index_spot(self, top_n: int = 300) -> Dict[str, Any]:
         primary_fn = "stock_zh_index_spot_sina"

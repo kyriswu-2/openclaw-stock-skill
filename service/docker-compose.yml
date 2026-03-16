@@ -21,6 +21,8 @@ services:
       - AKSHARE_PROXY_FETCH_TIMEOUT=8
       - AKSHARE_PROXY_FETCH_RETRIES=3
       - AKSHARE_PROXY_FETCH_BACKOFF_MS=300
+      - AKSHARE_API_RETRIES=3
+      - AKSHARE_API_BACKOFF_MS=400
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
