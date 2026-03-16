@@ -118,6 +118,13 @@ class AkshareAdapter:
             original_request = requests.sessions.Session.request
 
             def request_with_dynamic_proxy(session, method, url, **kwargs):
+                def _safe_host(raw: str) -> str:
+                    if not raw:
+                        return ""
+                    parsed = urlparse(raw)
+                    host = parsed.netloc or parsed.path or raw
+                    return host.split("@")[-1]
+
                 fixed_proxy_url = os.getenv("AKSHARE_PROXY_URL", self._proxy_url).strip()
                 proxy_api_url = os.getenv("AKSHARE_PROXY_API", self._proxy_api)
                 auth_key = os.getenv("AKSHARE_PROXY_AUTH_KEY", self._proxy_auth_key)
@@ -130,12 +137,20 @@ class AkshareAdapter:
                 target_host = ""
                 if isinstance(url, str):
                     target_host = urlparse(url).netloc or url
+                selected_mode = "direct"
+                selected_proxy = ""
+                proxy_api_host = _safe_host(proxy_api_url or "")
 
                 # The proxy-provider API itself must be called directly.
                 bypass_proxy = isinstance(url, str) and proxy_api_url and url.startswith(proxy_api_url)
+                if bypass_proxy:
+                    selected_mode = "proxy_api_direct"
+                    selected_proxy = proxy_api_host
 
                 if not bypass_proxy and fixed_proxy_url:
                     kwargs["proxies"] = {"http": fixed_proxy_url, "https": fixed_proxy_url}
+                    selected_mode = "fixed"
+                    selected_proxy = _safe_host(fixed_proxy_url)
                     if log_enabled:
                         logger.info(
                             "proxy_fixed_allocated method=%s target=%s proxy=%s",
@@ -159,6 +174,8 @@ class AkshareAdapter:
                             self._proxy_fetch_backoff_ms = max(0, int(fetch_backoff_ms))
                         proxy_dict, proxy_meta = self._build_proxy_dict()
                         kwargs["proxies"] = proxy_dict
+                        selected_mode = "pool"
+                        selected_proxy = str(proxy_meta.get("server") or "")
                         if log_enabled:
                             logger.info(
                                 "proxy_pool_allocated method=%s target=%s request_id=%s server=%s proxy_ip=%s deadline=%s area=%s isp=%s attempts=%s elapsed_ms=%s",
@@ -182,8 +199,21 @@ class AkshareAdapter:
                                 strict_mode,
                                 exc,
                             )
+                        selected_mode = "pool_failed"
+                        selected_proxy = proxy_api_host
                         if strict_mode:
                             raise RuntimeError(f"dynamic proxy allocation failed: {exc}") from exc
+
+                if log_enabled:
+                    logger.info(
+                        "proxy_route_selected method=%s target=%s mode=%s selected_proxy=%s proxy_api=%s strict=%s",
+                        method,
+                        target_host,
+                        selected_mode,
+                        selected_proxy,
+                        proxy_api_host,
+                        strict_mode,
+                    )
 
                 return original_request(session, method, url, **kwargs)
 
