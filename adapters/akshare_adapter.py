@@ -251,6 +251,27 @@ class AkshareAdapter:
             market = "bj"
         return market
 
+    def _to_prefixed_a_symbol(self, symbol: str) -> str:
+        s = self._clean_symbol(symbol)
+        if len(s) == 6 and s.isdigit():
+            return f"{self._market_from_symbol(s)}{s}"
+        return s
+
+    def _to_em_a_symbol(self, symbol: str) -> str:
+        s = self._clean_symbol(symbol)
+        if len(s) == 6 and s.isdigit():
+            market = self._market_from_symbol(s).upper()
+            return f"{s}.{market}"
+        return s
+
+    def _to_hk_symbol(self, symbol: str) -> str:
+        s = str(symbol or "").strip().upper()
+        if s.startswith("HK"):
+            s = s[2:]
+        if s.isdigit() and len(s) in {4, 5}:
+            return s.zfill(5)
+        return s
+
     def _filter_records_by_symbol(self, records: list[dict], symbol: str) -> list[dict]:
         if not symbol:
             return records
@@ -733,15 +754,42 @@ class AkshareAdapter:
         if err:
             return err
 
+        clean_symbol = self._clean_symbol(symbol)
+        prefixed_symbol = self._to_prefixed_a_symbol(clean_symbol)
+        hk_symbol = self._to_hk_symbol(symbol)
+
+        # AkShare 参数规则：
+        # 1) stock_intraday_em 仅需 symbol，不支持 period
+        # 2) stock_zh_a_hist_min_em 支持 A 股 period={1,5,15,30,60}
+        # 3) stock_hk_hist_min_em 支持港股分时
         candidates = [
-            ("stock_intraday_em", [{"symbol": symbol, "period": period}]),
-            ("stock_zh_a_minute", [{"symbol": symbol, "period": period}]),
+            (
+                "stock_zh_a_hist_min_em",
+                [{
+                    "symbol": clean_symbol,
+                    "period": period,
+                    "adjust": "" if period == "1" else "qfq",
+                }],
+            ),
+            (
+                "stock_zh_a_minute",
+                [{"symbol": prefixed_symbol, "period": period, "adjust": ""}],
+            ),
+            (
+                "stock_hk_hist_min_em",
+                [{
+                    "symbol": hk_symbol,
+                    "period": period,
+                    "adjust": "" if period == "1" else "qfq",
+                }],
+            ),
+            ("stock_intraday_em", [{"symbol": clean_symbol}]),
         ]
         used_fn, df, error = self._call_api_candidates(candidates)
         if used_fn is None:
             return self._error(fn_name, error)
 
-        return self._wrap(used_fn, symbol=symbol, period=period, items=self._to_records(df, top_n=top_n))
+        return self._wrap(used_fn, symbol=clean_symbol or symbol, period=period, items=self._to_records(df, top_n=top_n))
 
     def limit_pool(self, date: Optional[str] = None, top_n: int = 20) -> Dict[str, Any]:
         fn_name = "stock_zt_pool_em"
@@ -811,15 +859,20 @@ class AkshareAdapter:
         if err:
             return err
 
+        trade_date = self._normalize_trade_date(date)
         candidates = [
             ("stock_hsgt_fund_flow_summary_em", [{}]),
-            ("stock_hsgt_hist_em", [{}]),
+            ("stock_hsgt_fund_min_em", [{"symbol": "北向资金"}, {"symbol": "南向资金"}]),
+            (
+                "stock_hsgt_hist_em",
+                [{"symbol": "北向资金"}, {"symbol": "沪股通"}, {"symbol": "深股通"}, {"symbol": "南向资金"}],
+            ),
         ]
         used_fn, df, error = self._call_api_candidates(candidates)
         if used_fn is None:
             return self._error(fn_name, error)
 
-        return self._wrap(used_fn, items=self._to_records(df, top_n=top_n))
+        return self._wrap(used_fn, date=trade_date, items=self._to_records(df, top_n=top_n))
 
     def sector_money_flow(self, top_n: int = 10) -> Dict[str, Any]:
         fn_name = "stock_fund_flow_industry"
@@ -829,7 +882,8 @@ class AkshareAdapter:
 
         candidates = [
             ("stock_fund_flow_industry", [{"symbol": "即时"}]),
-            ("stock_sector_fund_flow_rank", [{"symbol": "即时", "sector_type": "行业资金流"}]),
+            ("stock_sector_fund_flow_rank", [{"indicator": "今日", "sector_type": "行业资金流"}]),
+            ("stock_sector_fund_flow_rank", [{"indicator": "5日", "sector_type": "概念资金流"}]),
         ]
         used_fn, df, error = self._call_api_candidates(candidates)
         if used_fn is None:
@@ -844,28 +898,36 @@ class AkshareAdapter:
             return err
 
         symbol = self._clean_symbol(symbol)
+        em_symbol = self._to_em_a_symbol(symbol)
 
         results: Dict[str, Any] = {}
 
         candidates_profit = [
-            ("stock_financial_abstract_ths", [{"symbol": symbol, "indicator": "按年度"}]),
-            ("stock_profit_sheet_by_annual_em", [{"symbol": symbol}]),
+            ("stock_financial_abstract_new_ths", [{"symbol": symbol, "indicator": "按年度"}]),
+            ("stock_financial_analysis_indicator_em", [{"symbol": em_symbol, "indicator": "按报告期"}]),
         ]
         used_fn, df, error = self._call_api_candidates(candidates_profit)
         if used_fn:
             results["profit"] = self._to_records(df, top_n=top_n)
 
         candidates_balance = [
-            ("stock_balance_sheet_by_annual_em", [{"symbol": symbol}]),
+            ("stock_balance_sheet_by_report_em", [{"symbol": em_symbol}]),
         ]
         used_fn2, df2, _ = self._call_api_candidates(candidates_balance)
         if used_fn2:
             results["balance"] = self._to_records(df2, top_n=top_n)
 
+        candidates_profile = [
+            ("stock_individual_info_em", [{"symbol": symbol}]),
+        ]
+        used_fn3, df3, _ = self._call_api_candidates(candidates_profile)
+        if used_fn3:
+            results["profile"] = self._to_records(df3, top_n=top_n)
+
         if not results:
             return self._error(fn_name, error)
 
-        return self._wrap(fn_name, symbol=symbol, **results)
+        return self._wrap(fn_name, symbol=symbol, em_symbol=em_symbol, **results)
 
     def margin_lhb(self, symbol: Optional[str], date: Optional[str], top_n: int = 10) -> Dict[str, Any]:
         fn_name = "stock_lhb_detail_em"
@@ -890,10 +952,18 @@ class AkshareAdapter:
 
         # 融资融券
         try:
-            df_margin = self._ak.stock_margin_underlying_info_szse()
+            df_margin = self._ak.stock_margin_underlying_info_szse(date=trade_date)
             results["margin"] = self._to_records(df_margin, top_n=top_n)
         except Exception:
-            pass
+            try:
+                df_margin = self._ak.stock_margin_detail_sse(date=trade_date)
+                results["margin"] = self._to_records(df_margin, top_n=top_n)
+            except Exception:
+                try:
+                    df_margin = self._ak.stock_margin_detail_szse(date=trade_date)
+                    results["margin"] = self._to_records(df_margin, top_n=top_n)
+                except Exception:
+                    pass
 
         return self._wrap(fn_name, date=trade_date, **results)
 
@@ -904,8 +974,9 @@ class AkshareAdapter:
             return err
 
         candidates = [
-            ("stock_news_em", [{"symbol": "全部", "page": "1"}]),
-            ("stock_news_em", [{}]),
+            ("stock_news_main_cx", [{}]),
+            ("stock_news_em", [{"symbol": "财经"}]),
+            ("stock_news_em", [{"symbol": "A股"}]),
             ("futures_news_baidu", [{"symbol": "全部", "page": "1"}]),
         ]
         used_fn, df, error = self._call_api_candidates(candidates)
