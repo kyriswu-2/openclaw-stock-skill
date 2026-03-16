@@ -389,6 +389,137 @@ class AkshareAdapter:
             except Exception as fallback_exc:
                 return self._error(primary_fn, f"sina failed: {exc}; em failed: {fallback_exc}")
 
+    def _index_name_candidates(self, symbol: str, query: str) -> list[str]:
+        raw = (symbol or "").strip()
+        raw_upper = raw.upper()
+        q = query or ""
+
+        alias_map = {
+            "HSTECH": ["恒生科技指数", "恒生科技"],
+            "HSI": ["恒生指数", "恒生"],
+            "IXIC": ["纳斯达克综合指数", "纳斯达克"],
+            "DJI": ["道琼斯工业平均指数", "道琼斯"],
+            "SPX": ["标普500指数", "标普500", "标普"],
+        }
+
+        names: list[str] = []
+        if raw_upper in alias_map:
+            names.extend(alias_map[raw_upper])
+
+        if "恒生科技" in q:
+            names.extend(alias_map["HSTECH"])
+        if "恒生指数" in q or "恒指" in q:
+            names.extend(alias_map["HSI"])
+        if "纳斯达克" in q or "纳指" in q:
+            names.extend(alias_map["IXIC"])
+        if "道琼斯" in q:
+            names.extend(alias_map["DJI"])
+        if "标普" in q:
+            names.extend(alias_map["SPX"])
+
+        # De-duplicate while preserving order.
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            if name and name not in seen:
+                seen.add(name)
+                uniq.append(name)
+        return uniq
+
+    def _build_kline_candidates(
+        self,
+        symbol: str,
+        period: str,
+        start: str,
+        end: str,
+        query: Optional[str] = None,
+    ) -> list[tuple[str, list[dict]]]:
+        raw = (symbol or "").strip()
+        raw_upper = raw.upper()
+        q = query or ""
+        q_lower = q.lower()
+
+        is_a_share = raw.isdigit() and len(raw) == 6
+        is_hk_hint = raw_upper.startswith("HK") or "港股" in q
+        is_us_hint = any(k in q_lower for k in ["美股", "nasdaq", "dow", "sp500", "s&p", "纳指", "道琼斯", "标普"])
+        index_names = self._index_name_candidates(symbol=raw, query=q)
+        is_index_hint = bool(index_names) or "指数" in q
+
+        candidates: list[tuple[str, list[dict]]] = []
+
+        if is_a_share:
+            candidates.append((
+                "stock_zh_a_hist",
+                [{"symbol": raw, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
+            ))
+
+        if is_hk_hint:
+            hk_symbol = raw_upper[2:] if raw_upper.startswith("HK") else raw_upper
+            if hk_symbol.isdigit() and len(hk_symbol) in {4, 5}:
+                hk_symbol = hk_symbol.zfill(5)
+            if hk_symbol:
+                candidates.append((
+                    "stock_hk_hist",
+                    [{"symbol": hk_symbol, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
+                ))
+
+        if is_us_hint and raw_upper:
+            us_symbol_pool = [raw_upper]
+            if raw_upper in {"IXIC", "DJI", "SPX"}:
+                us_symbol_pool.extend([".IXIC", ".DJI", ".INX"])
+            candidates.append((
+                "stock_us_hist",
+                [
+                    {"symbol": s, "period": period, "start_date": start, "end_date": end, "adjust": ""}
+                    for s in us_symbol_pool
+                ],
+            ))
+
+        if is_index_hint:
+            for idx_name in index_names:
+                candidates.append(("index_global_hist_em", [{"symbol": idx_name}]))
+
+        # Broad fallbacks for ambiguous symbols.
+        if raw and not is_a_share:
+            candidates.append(("index_global_hist_em", [{"symbol": raw}]))
+            candidates.append((
+                "stock_hk_hist",
+                [{"symbol": raw_upper, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
+            ))
+            candidates.append((
+                "stock_us_hist",
+                [{"symbol": raw_upper, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
+            ))
+
+        # Always keep A-share as the last fallback for six-digit inputs.
+        if raw:
+            candidates.append((
+                "stock_zh_a_hist",
+                [{"symbol": raw, "period": period, "start_date": start, "end_date": end, "adjust": ""}],
+            ))
+
+        return candidates
+
+    def _fetch_kline_df(
+        self,
+        symbol: str,
+        period: str,
+        start: str,
+        end: str,
+        query: Optional[str] = None,
+    ) -> tuple[Optional[str], Any, str]:
+        candidates = self._build_kline_candidates(symbol=symbol, period=period, start=start, end=end, query=query)
+        used_fn, df, error = self._call_api_candidates(candidates)
+        if used_fn is None:
+            return None, None, error
+
+        if hasattr(df, "iloc"):
+            try:
+                df = df.iloc[::-1]
+            except Exception:
+                pass
+        return used_fn, df, ""
+
     def stock_kline(
         self,
         symbol: str,
@@ -396,8 +527,9 @@ class AkshareAdapter:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         top_n: int = 60,
+        query: Optional[str] = None,
     ) -> Dict[str, Any]:
-        fn_name = "stock_zh_a_hist"
+        fn_name = "stock_kline"
         err = self._ready_or_error(fn_name)
         if err:
             return err
@@ -418,17 +550,12 @@ class AkshareAdapter:
         end = self._normalize_trade_date(end_date)
 
         try:
-            df = self._ak.stock_zh_a_hist(
-                symbol=symbol,
-                period=period,
-                start_date=start,
-                end_date=end,
-                adjust="",
-            )
-            if hasattr(df, "iloc"):
-                df = df.iloc[::-1]
+            used_fn, df, error = self._fetch_kline_df(symbol=symbol, period=period, start=start, end=end, query=query)
+            if used_fn is None:
+                return self._error(fn_name, error)
+
             return self._wrap(
-                fn_name,
+                used_fn,
                 symbol=symbol,
                 period=period,
                 start_date=start,
@@ -438,7 +565,7 @@ class AkshareAdapter:
         except Exception as exc:
             return self._error(fn_name, str(exc))
 
-    def stock_chart(self, symbol: str, period: str = "daily", days: int = 30) -> Dict[str, Any]:
+    def stock_chart(self, symbol: str, period: str = "daily", days: int = 30, query: Optional[str] = None) -> Dict[str, Any]:
         """生成股票K线图"""
         fn_name = "stock_chart"
         err = self._ready_or_error(fn_name)
@@ -477,13 +604,10 @@ class AkshareAdapter:
             start = start_dt.strftime("%Y%m%d")
             end = end_dt.strftime("%Y%m%d")
 
-            df = self._ak.stock_zh_a_hist(
-                symbol=symbol,
-                period=period,
-                start_date=start,
-                end_date=end,
-                adjust="",
-            )
+            used_fn, df, error = self._fetch_kline_df(symbol=symbol, period=period, start=start, end=end, query=query)
+            if used_fn is None:
+                return self._error(fn_name, error)
+
             if df is None or len(df) == 0:
                 return self._error(fn_name, "no data returned")
 

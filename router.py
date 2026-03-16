@@ -45,6 +45,18 @@ STOCK_NAME_MAP = {
     "长城汽车": "601633",
 }
 
+# Common HK/US index aliases used in natural-language queries.
+# These are routed as symbols when users do not provide explicit codes.
+INDEX_NAME_MAP = {
+    "恒生科技": "HSTECH",
+    "恒生指数": "HSI",
+    "恒指": "HSI",
+    "纳斯达克": "IXIC",
+    "道琼斯": "DJI",
+    "标普500": "SPX",
+    "标普": "SPX",
+}
+
 @dataclass
 class IntentObj:
     intent: str
@@ -64,7 +76,11 @@ def _extract_symbol(query: str) -> Optional[str]:
         if name in query:
             return STOCK_NAME_MAP[name]
 
-    m = re.search(r"\b(hk\d{4,5}|[A-Z]{1,5})\b", query)
+    for name in sorted(INDEX_NAME_MAP, key=len, reverse=True):
+        if name in query:
+            return INDEX_NAME_MAP[name]
+
+    m = re.search(r"\b(hk\d{4,5}|[A-Z]{1,10})\b", query)
     if m:
         return m.group(1)
 

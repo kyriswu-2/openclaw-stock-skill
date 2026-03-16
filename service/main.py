@@ -88,25 +88,33 @@ def dispatch(req: IntentRequest, adapter: AkshareAdapter) -> Dict[str, Any]:
 
     if req.intent == KLINE_ANALYSIS:
         top_n = req.top_n or 10
-        symbol = req.symbol or "000001"
+        symbol = req.symbol
+        if not symbol:
+            return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": KLINE_ANALYSIS}
         period = req.period or "daily"
-        return adapter.stock_kline(symbol=symbol, period=period, top_n=top_n)
+        return adapter.stock_kline(symbol=symbol, period=period, top_n=top_n, query=req.query)
 
     if req.intent == KLINE_CHART:
-        symbol = req.symbol or "000001"
+        symbol = req.symbol
+        if not symbol:
+            return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": KLINE_CHART}
         period = req.period or "daily"
         days = req.top_n or 30
-        return adapter.stock_chart(symbol=symbol, period=period, days=days)
+        return adapter.stock_chart(symbol=symbol, period=period, days=days, query=req.query)
 
     if req.intent == INTRADAY_ANALYSIS:
         top_n = req.top_n or 30
-        symbol = req.symbol or "000001"
+        symbol = req.symbol
+        if not symbol:
+            return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": INTRADAY_ANALYSIS}
         period = req.period if req.period in {"1", "5", "15", "30", "60"} else "1"
         return adapter.stock_intraday(symbol=symbol, period=period, top_n=top_n)
 
     if req.intent == VOLUME_ANALYSIS:
         # 直接复用 stock_intraday 提供分时数据供分析
-        symbol = req.symbol or "000001"
+        symbol = req.symbol
+        if not symbol:
+            return {"ok": False, "error": "请输入股票/指数代码或名称", "intent": VOLUME_ANALYSIS}
         return adapter.stock_intraday(symbol=symbol, period="1", top_n=60)
 
     if req.intent == LIMIT_STATS:
